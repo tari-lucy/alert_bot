@@ -10,28 +10,65 @@ class TextFilter:
     """
     Фильтр для проверки текста сообщений на соответствие ключевым фразам.
     Поддерживает точное совпадение с игнорированием эмодзи и регистра.
+    Различает типы сообщений: тревога (alert) и отбой (clear).
     """
 
-    def __init__(self, keywords_file: str):
+    def __init__(self, alert_keywords_file: str, clear_keywords_file: str):
         """
         Args:
-            keywords_file: Путь к файлу с ключевыми фразами
+            alert_keywords_file: Путь к файлу с фразами тревоги
+            clear_keywords_file: Путь к файлу с фразами отбоя
         """
-        self.keywords_file = keywords_file
-        self.keywords: Set[str] = set()
+        self.alert_keywords_file = alert_keywords_file
+        self.clear_keywords_file = clear_keywords_file
+        self.alert_keywords: Set[str] = set()
+        self.clear_keywords: Set[str] = set()
 
-    def load_keywords(self) -> int:
+    def load_keywords(self) -> tuple:
         """
-        Загружает ключевые фразы из файла.
+        Загружает ключевые фразы из обоих файлов.
 
         Returns:
-            Количество загруженных ключевых фраз
+            Кортеж (количество_фраз_тревоги, количество_фраз_отбоя)
+        """
+        alert_count = self._load_keywords_from_file(
+            self.alert_keywords_file,
+            self.alert_keywords,
+            "тревоги"
+        )
+        clear_count = self._load_keywords_from_file(
+            self.clear_keywords_file,
+            self.clear_keywords,
+            "отбоя"
+        )
+
+        logger.info(
+            f"Загружено {alert_count} фраз тревоги и {clear_count} фраз отбоя"
+        )
+        return (alert_count, clear_count)
+
+    def _load_keywords_from_file(
+        self,
+        file_path: str,
+        keywords_set: Set[str],
+        category: str
+    ) -> int:
+        """
+        Загружает ключевые фразы из одного файла.
+
+        Args:
+            file_path: Путь к файлу
+            keywords_set: Множество для сохранения фраз
+            category: Название категории (для логов)
+
+        Returns:
+            Количество загруженных фраз
         """
         try:
-            with open(self.keywords_file, 'r', encoding='utf-8') as f:
+            with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
-            self.keywords.clear()
+            keywords_set.clear()
 
             for line in lines:
                 keyword = line.strip()
@@ -43,16 +80,16 @@ class TextFilter:
                 # Нормализуем ключевую фразу при загрузке
                 normalized = self._normalize_text(keyword)
                 if normalized:
-                    self.keywords.add(normalized)
+                    keywords_set.add(normalized)
 
-            logger.info(f"Загружено {len(self.keywords)} ключевых фраз из {self.keywords_file}")
-            return len(self.keywords)
+            logger.info(f"Загружено {len(keywords_set)} фраз {category} из {file_path}")
+            return len(keywords_set)
 
         except FileNotFoundError:
-            logger.error(f"Файл ключевых фраз не найден: {self.keywords_file}")
+            logger.error(f"Файл фраз {category} не найден: {file_path}")
             raise
         except Exception as e:
-            logger.error(f"Ошибка при загрузке ключевых фраз: {e}")
+            logger.error(f"Ошибка при загрузке фраз {category}: {e}")
             raise
 
     def _remove_emojis(self, text: str) -> str:
@@ -115,44 +152,53 @@ class TextFilter:
 
         return text
 
-    def matches_keyword(self, text: str) -> bool:
+    def get_message_type(self, text: str) -> str:
         """
-        Проверяет, совпадает ли текст ПОЛНОСТЬЮ с одной из ключевых фраз.
+        Определяет тип сообщения по тексту.
 
         Args:
             text: Текст для проверки
 
         Returns:
-            True если текст точно совпадает с ключевой фразой
+            'alert' - тревога, 'clear' - отбой, None - не совпало
         """
-        if not text or not self.keywords:
-            return False
+        if not text:
+            return None
 
         normalized_text = self._normalize_text(text)
 
-        # Точное совпадение всего текста
-        matches = normalized_text in self.keywords
+        # Проверяем тревогу
+        if normalized_text in self.alert_keywords:
+            logger.info(f"Найдена ТРЕВОГА. Текст: '{text[:100]}...'")
+            return 'alert'
 
-        if matches:
-            logger.info(f"Найдено совпадение с ключевой фразой. Исходный текст: '{text[:100]}...'")
+        # Проверяем отбой
+        if normalized_text in self.clear_keywords:
+            logger.info(f"Найден ОТБОЙ. Текст: '{text[:100]}...'")
+            return 'clear'
 
-        return matches
+        return None
 
-    def check_message(self, message: Message) -> bool:
+    def check_message(self, message: Message) -> str:
         """
-        Проверяет сообщение Telegram на соответствие ключевым фразам.
+        Проверяет сообщение Telegram и определяет его тип.
 
         Args:
             message: Объект сообщения Telethon
 
         Returns:
-            True если текст сообщения совпадает с ключевой фразой
+            'alert' - тревога, 'clear' - отбой, None - не совпало
         """
         if not message or not message.text:
-            return False
+            return None
 
-        return self.matches_keyword(message.text)
+        return self.get_message_type(message.text)
 
-    def get_keywords_count(self) -> int:
-        """Возвращает количество загруженных ключевых фраз."""
-        return len(self.keywords)
+    def get_keywords_count(self) -> tuple:
+        """
+        Возвращает количество загруженных ключевых фраз.
+
+        Returns:
+            Кортеж (количество_тревог, количество_отбоев)
+        """
+        return (len(self.alert_keywords), len(self.clear_keywords))

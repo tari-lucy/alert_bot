@@ -17,9 +17,16 @@ class Config:
     RANDOM_DELAY = os.getenv('RANDOM_DELAY', 'true').lower() == 'true'
     DELAY_VARIANCE = int(os.getenv('DELAY_VARIANCE', 5))  # ±5 секунд по умолчанию
 
-    # Фильтрация и публикация
-    KEYWORDS_FILE = os.getenv('KEYWORDS_FILE', 'data/keywords.txt')
+    # Фильтрация и публикация - ТРЕВОГА
+    KEYWORDS_ALERT_FILE = os.getenv('KEYWORDS_ALERT_FILE', 'data/keywords_alert.txt')
     ALERT_TEMPLATE = os.getenv('ALERT_TEMPLATE', '')
+
+    # Фильтрация и публикация - ОТБОЙ
+    KEYWORDS_CLEAR_FILE = os.getenv('KEYWORDS_CLEAR_FILE', 'data/keywords_clear.txt')
+    CLEAR_TEMPLATE = os.getenv('CLEAR_TEMPLATE', '')
+
+    # Обратная совместимость (старый KEYWORDS_FILE)
+    KEYWORDS_FILE = os.getenv('KEYWORDS_FILE', KEYWORDS_ALERT_FILE)
 
     # Гибридный режим: использовать Bot API для публикации (опционально)
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')  # Если указан - публикация через Bot API
@@ -40,12 +47,18 @@ class Config:
         if not cls.TARGET_CHANNEL:
             raise ValueError("TARGET_CHANNEL должен быть указан в .env файле")
 
-        # Проверка файла ключевых фраз
-        if not os.path.exists(cls.KEYWORDS_FILE):
-            raise ValueError(f"Файл ключевых фраз не найден: {cls.KEYWORDS_FILE}")
+        # Проверка файлов ключевых фраз
+        if not os.path.exists(cls.KEYWORDS_ALERT_FILE):
+            raise ValueError(f"Файл ключевых фраз тревоги не найден: {cls.KEYWORDS_ALERT_FILE}")
 
-        # Проверка шаблона алерта
+        if not os.path.exists(cls.KEYWORDS_CLEAR_FILE):
+            raise ValueError(f"Файл ключевых фраз отбоя не найден: {cls.KEYWORDS_CLEAR_FILE}")
+
+        # Проверка шаблонов
         if not cls.ALERT_TEMPLATE or cls.ALERT_TEMPLATE.strip() == '':
             raise ValueError("ALERT_TEMPLATE должен быть указан в .env файле")
+
+        if not cls.CLEAR_TEMPLATE or cls.CLEAR_TEMPLATE.strip() == '':
+            raise ValueError("CLEAR_TEMPLATE должен быть указан в .env файле")
 
         return True

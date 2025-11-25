@@ -34,7 +34,10 @@ class AlertBot:
             self.publisher = TelegramPublisher(self.client, Config.TARGET_CHANNEL)
 
         self.storage = PostStorage(Config.DATA_FILE)
-        self.filter = TextFilter(keywords_file=Config.KEYWORDS_FILE)
+        self.filter = TextFilter(
+            alert_keywords_file=Config.KEYWORDS_ALERT_FILE,
+            clear_keywords_file=Config.KEYWORDS_CLEAR_FILE
+        )
 
     async def start(self):
         await self.client.start(phone=Config.PHONE)
@@ -45,13 +48,17 @@ class AlertBot:
 
         # Загрузка ключевых фраз
         try:
-            keywords_count = self.filter.load_keywords()
-            logger.info(f"Инициализирован фильтр с {keywords_count} ключевыми фразами")
+            alert_count, clear_count = self.filter.load_keywords()
+            logger.info(
+                f"Инициализирован фильтр: {alert_count} фраз тревоги, "
+                f"{clear_count} фраз отбоя"
+            )
 
-            if keywords_count == 0:
-                logger.warning("ВНИМАНИЕ: Список ключевых фраз пуст! Алерты не будут публиковаться.")
+            if alert_count == 0 and clear_count == 0:
+                logger.warning("ВНИМАНИЕ: Списки ключевых фраз пусты! Сообщения не будут публиковаться.")
 
-            logger.info(f"Шаблон алерта: '{Config.ALERT_TEMPLATE[:50]}...'")
+            logger.info(f"Шаблон тревоги: '{Config.ALERT_TEMPLATE[:50]}...'")
+            logger.info(f"Шаблон отбоя: '{Config.CLEAR_TEMPLATE[:50]}...'")
 
         except Exception as e:
             logger.error(f"Ошибка при инициализации фильтра: {e}")
@@ -80,14 +87,16 @@ class AlertBot:
                 await self.storage.mark_processed(message.id)
                 continue
 
-            # Проверка на совпадение с ключевой фразой
-            if self.filter.check_message(message):
+            # Определяем тип сообщения (тревога/отбой)
+            message_type = self.filter.check_message(message)
+
+            if message_type == 'alert':
                 logger.info(
-                    f"Пост {message.id} совпадает с ключевой фразой! "
+                    f"Пост {message.id} - ТРЕВОГА! "
                     f"Текст: '{message.text[:100]}...'"
                 )
 
-                # Публикуем СТАТИЧНЫЙ ШАБЛОН (не исходный текст!)
+                # Публикуем шаблон ТРЕВОГИ
                 success = await self.publisher.publish_alert_template(
                     template_text=Config.ALERT_TEMPLATE,
                     source_message_id=message.id
@@ -96,9 +105,28 @@ class AlertBot:
                 if success:
                     await self.storage.mark_processed(message.id)
                     new_posts_count += 1
-                    logger.info(f"Алерт успешно опубликован для поста {message.id}")
+                    logger.info(f"Тревога успешно опубликована для поста {message.id}")
                 else:
-                    logger.error(f"Не удалось опубликовать алерт для поста {message.id}")
+                    logger.error(f"Не удалось опубликовать тревогу для поста {message.id}")
+
+            elif message_type == 'clear':
+                logger.info(
+                    f"Пост {message.id} - ОТБОЙ! "
+                    f"Текст: '{message.text[:100]}...'"
+                )
+
+                # Публикуем шаблон ОТБОЯ
+                success = await self.publisher.publish_alert_template(
+                    template_text=Config.CLEAR_TEMPLATE,
+                    source_message_id=message.id
+                )
+
+                if success:
+                    await self.storage.mark_processed(message.id)
+                    new_posts_count += 1
+                    logger.info(f"Отбой успешно опубликован для поста {message.id}")
+                else:
+                    logger.error(f"Не удалось опубликовать отбой для поста {message.id}")
 
             else:
                 # Пост не совпал с ключевыми фразами
@@ -112,7 +140,7 @@ class AlertBot:
 
         # Итоговая статистика
         if new_posts_count > 0:
-            logger.info(f"Опубликовано алертов: {new_posts_count}")
+            logger.info(f"Опубликовано сообщений: {new_posts_count}")
 
         if filtered_posts_count > 0:
             logger.debug(f"Отфильтровано постов (не совпали): {filtered_posts_count}")
