@@ -1,0 +1,18 @@
+[Unit]
+Description=Alert Bot - Telegram alert monitoring
+After=network.target
+
+[Service]
+Type=simple
+User=tarrri
+WorkingDirectory=/home/tarrri/projects/bots/alert_bot
+ExecStart=/home/tarrri/projects/bots/alert_bot/venv/bin/python3 /home/tarrri/projects/bots/alert_bot/main.py
+Restart=always
+RestartSec=10
+
+# Логирование
+StandardOutput=append:/home/tarrri/projects/bots/alert_bot/logs/systemd.log
+StandardError=append:/home/tarrri/projects/bots/alert_bot/logs/systemd_error.log
+
+[Install]
+WantedBy=multi-user.target
