@@ -74,10 +74,11 @@ class TelegramPublisher:
                 logger.error("Попытка опубликовать пустой шаблон")
                 return False
 
-            # Публикуем только текст, медиа игнорируем
+            # Публикуем только текст с HTML форматированием
             await self.client.send_message(
                 self.target_channel,
-                template_text
+                template_text,
+                parse_mode='html'
             )
 
             log_msg = "Шаблон алерта успешно опубликован"

@@ -44,10 +44,11 @@ class BotPublisher:
                 logger.error("Попытка опубликовать пустой шаблон")
                 return False
 
-            # Публикация через Bot API
+            # Публикация через Bot API с HTML форматированием
             await self.bot.send_message(
                 chat_id=self.target_channel,
-                text=template_text
+                text=template_text,
+                parse_mode='HTML'
             )
 
             log_msg = "✅ Шаблон алерта опубликован через Bot API"
