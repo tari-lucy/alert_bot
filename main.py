@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import asyncio
 import random
+from datetime import datetime
 from telethon import TelegramClient
 from telethon.errors import FloodWaitError, SessionPasswordNeededError
+from telegram import Bot
 from src.config import Config
 from src.parser import TelegramParser
 from src.publisher import TelegramPublisher
@@ -38,6 +40,18 @@ class AlertBot:
             alert_keywords_file=Config.KEYWORDS_ALERT_FILE,
             clear_keywords_file=Config.KEYWORDS_CLEAR_FILE
         )
+        self._skip_old = False
+
+    async def notify_admin(self, text: str):
+        """Отправляет уведомление админу в личку через Bot API."""
+        if not Config.ADMIN_CHAT_ID or not Config.BOT_TOKEN:
+            return
+        try:
+            bot = Bot(token=Config.BOT_TOKEN)
+            await bot.send_message(chat_id=Config.ADMIN_CHAT_ID, text=text)
+            logger.info("Уведомление отправлено админу")
+        except Exception as e:
+            logger.error(f"Не удалось отправить уведомление админу: {e}")
 
     async def start(self):
         await self.client.start(phone=Config.PHONE)
@@ -71,6 +85,18 @@ class AlertBot:
     async def process_new_posts(self):
         messages = await self.parser.get_latest_posts(limit=10)
 
+        # После переподключения — пропускаем накопившиеся посты, не публикуя
+        if self._skip_old:
+            skipped = 0
+            for message in messages:
+                if not self.storage.is_processed(message.id):
+                    await self.storage.mark_processed(message.id)
+                    skipped += 1
+            if skipped > 0:
+                logger.info(f"Пропущено {skipped} старых постов после переподключения")
+            self._skip_old = False
+            return
+
         new_posts_count = 0
         filtered_posts_count = 0
 
@@ -83,8 +109,8 @@ class AlertBot:
 
             # Проверяем наличие текста в посте
             if not message.text:
-                logger.debug(f"Пост {message.id} не содержит текста, пропускаем")
-                await self.storage.mark_processed(message.id)
+                logger.debug(f"Пост {message.id} не содержит текста, пропускаем (будет перепроверен)")
+                # НЕ помечаем как обработанный - возможно текст будет добавлен позже
                 continue
 
             # Определяем тип сообщения (тревога/отбой)
@@ -158,12 +184,41 @@ class AlertBot:
 
             while True:
                 try:
+                    if not self.client.is_connected():
+                        logger.warning("Клиент отключен от Telegram, переподключаемся...")
+                        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        await self.notify_admin(
+                            f"[AlertBot] {now}\n"
+                            f"Потеряно соединение с Telegram. Пытаюсь переподключиться..."
+                        )
+                        await self.client.connect()
+                        if not await self.client.is_user_authorized():
+                            logger.error("Сессия не авторизована после переподключения")
+                            await self.client.start(phone=Config.PHONE)
+                        logger.info("Переподключение успешно")
+                        self._skip_old = True
+                        await self.notify_admin(
+                            f"[AlertBot] {now}\n"
+                            f"Переподключение успешно. Бот снова работает.\n"
+                            f"Старые посты будут пропущены."
+                        )
+
                     await self.process_new_posts()
                 except FloodWaitError as e:
                     # Telegram просит подождать - это нормально
                     wait_time = e.seconds
                     logger.warning(f"FloodWaitError: ждем {wait_time} секунд по требованию Telegram")
                     await asyncio.sleep(wait_time)
+                    continue
+                except ConnectionError as e:
+                    logger.error(f"Ошибка соединения: {e}")
+                    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    await self.notify_admin(
+                        f"[AlertBot] {now}\n"
+                        f"Ошибка соединения: {e}\n"
+                        f"Повторная попытка через 30 секунд..."
+                    )
+                    await asyncio.sleep(30)
                     continue
                 except Exception as e:
                     logger.error(f"Ошибка при обработке постов: {e}", exc_info=True)

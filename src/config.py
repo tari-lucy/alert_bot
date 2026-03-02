@@ -32,6 +32,9 @@ class Config:
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')  # Если указан - публикация через Bot API
     USE_BOT_FOR_PUBLISHING = bool(BOT_TOKEN)
 
+    # Уведомления администратора о сбоях
+    ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
+
     SESSION_NAME = 'alert_bot_session'
     DATA_FILE = 'data/processed_posts.json'
     LOG_FILE = 'logs/bot.log'

@@ -6,7 +6,7 @@ def setup_logger(name='alert_bot'):
     os.makedirs('logs', exist_ok=True)
 
     logger = logging.getLogger(name)
-    logger.setLevel(logging.INFO)
+    logger.setLevel(logging.DEBUG)
 
     if logger.handlers:
         return logger
@@ -15,10 +15,10 @@ def setup_logger(name='alert_bot'):
         f'logs/bot_{datetime.now().strftime("%Y%m%d")}.log',
         encoding='utf-8'
     )
-    file_handler.setLevel(logging.INFO)
+    file_handler.setLevel(logging.DEBUG)
 
     console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.DEBUG)
 
     formatter = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(message)s',
