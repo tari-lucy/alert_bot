@@ -45,6 +45,11 @@ class Config:
     # Подпись источника в публикуемых энергопостах (текстом, без ссылки)
     ENERGY_SOURCE_NAME = os.getenv('ENERGY_SOURCE_NAME', 'Севастопольэнерго')
 
+    # Публиковать посты о СНЯТИИ ограничений (lifted). По умолчанию выключено:
+    # локальные/технологические восстановления давали ложные срабатывания.
+    # Графики отключений публикуются всегда.
+    ENERGY_LIFTED_ENABLED = os.getenv('ENERGY_LIFTED_ENABLED', 'false').lower() == 'true'
+
     # LLM (vsellm.ru — OpenAI-совместимый шлюз) для извлечения структуры из энергопостов
     LLM_API_KEY = os.getenv('LLM_API_KEY', '')
     LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'https://api.vsellm.ru/v1')

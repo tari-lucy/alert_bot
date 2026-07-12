@@ -316,6 +316,11 @@ class AlertBot:
                 await self.storage.mark_processed(message.id, channel)
                 continue
 
+            if extraction['type'] == 'lifted' and not Config.ENERGY_LIFTED_ENABLED:
+                logger.info(f"Энергопост {message.id}: 'снятие ограничений' отключено настройкой — не публикуем")
+                await self.storage.mark_processed(message.id, channel)
+                continue
+
             # Сверка извлечённых данных с текстом поста (защита от ошибок модели)
             ok, reason = verify_outage(extraction, message.text)
             if not ok:
