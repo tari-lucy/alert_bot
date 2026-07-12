@@ -32,6 +32,27 @@ class Config:
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')  # Если указан - публикация через Bot API
     USE_BOT_FOR_PUBLISHING = bool(BOT_TOKEN)
 
+    # MAX Messenger (опционально — оставьте пустым для отключения)
+    MAX_BOT_TOKEN = os.getenv('MAX_BOT_TOKEN', '')
+    MAX_TARGET_CHANNEL = os.getenv('MAX_TARGET_CHANNEL', '')
+    MAX_ENABLED = bool(MAX_BOT_TOKEN and MAX_TARGET_CHANNEL)
+
+    # Второй источник — канал энергетиков (Севастопольэнерго): отключения по очередям.
+    # Посты преобразуются через LLM и публикуются в те же цели (TG + MAX).
+    ENERGY_SOURCE_CHANNEL = os.getenv('ENERGY_SOURCE_CHANNEL', '')
+    QUEUE_1_ADDRESSES_FILE = os.getenv('QUEUE_1_ADDRESSES_FILE', 'data/queue_1_addresses.txt')
+    QUEUE_2_ADDRESSES_FILE = os.getenv('QUEUE_2_ADDRESSES_FILE', 'data/queue_2_addresses.txt')
+    # Подпись источника в публикуемых энергопостах (текстом, без ссылки)
+    ENERGY_SOURCE_NAME = os.getenv('ENERGY_SOURCE_NAME', 'Севастопольэнерго')
+
+    # LLM (vsellm.ru — OpenAI-совместимый шлюз) для извлечения структуры из энергопостов
+    LLM_API_KEY = os.getenv('LLM_API_KEY', '')
+    LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'https://api.vsellm.ru/v1')
+    LLM_MODEL = os.getenv('LLM_MODEL', 'openai/gpt-4.1-nano')
+
+    # Второй источник активен, только если задан канал и ключ LLM
+    ENERGY_ENABLED = bool(ENERGY_SOURCE_CHANNEL and LLM_API_KEY)
+
     # Уведомления администратора о сбоях
     ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID', '')
 
@@ -63,5 +84,13 @@ class Config:
 
         if not cls.CLEAR_TEMPLATE or cls.CLEAR_TEMPLATE.strip() == '':
             raise ValueError("CLEAR_TEMPLATE должен быть указан в .env файле")
+
+        # Проверка MAX: если токен задан, канал тоже должен быть
+        if cls.MAX_BOT_TOKEN and not cls.MAX_TARGET_CHANNEL:
+            raise ValueError("MAX_TARGET_CHANNEL должен быть указан, если задан MAX_BOT_TOKEN")
+
+        # Проверка второго источника: если канал задан, нужен ключ LLM
+        if cls.ENERGY_SOURCE_CHANNEL and not cls.LLM_API_KEY:
+            raise ValueError("LLM_API_KEY должен быть указан, если задан ENERGY_SOURCE_CHANNEL")
 
         return True

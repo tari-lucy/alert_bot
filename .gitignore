@@ -50,3 +50,8 @@ data/*.sqlite
 # OS
 .DS_Store
 Thumbs.db
+
+# Локальные материалы, не для репозитория
+posts_example/
+licence.docx
+*.docx

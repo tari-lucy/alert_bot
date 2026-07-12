@@ -171,15 +171,17 @@ class TextFilter:
 
         normalized_text = self._normalize_text(text)
 
-        # Проверяем тревогу
-        if normalized_text in self.alert_keywords:
-            logger.info(f"Найдена ТРЕВОГА. Текст: '{text[:100]}...'")
-            return 'alert'
+        # Проверяем тревогу (фраза в начале текста)
+        for keyword in self.alert_keywords:
+            if normalized_text.startswith(keyword):
+                logger.info(f"Найдена ТРЕВОГА. Текст: '{text[:100]}...'")
+                return 'alert'
 
-        # Проверяем отбой
-        if normalized_text in self.clear_keywords:
-            logger.info(f"Найден ОТБОЙ. Текст: '{text[:100]}...'")
-            return 'clear'
+        # Проверяем отбой (фраза в начале текста)
+        for keyword in self.clear_keywords:
+            if normalized_text.startswith(keyword):
+                logger.info(f"Найден ОТБОЙ. Текст: '{text[:100]}...'")
+                return 'clear'
 
         return None
 
