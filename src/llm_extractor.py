@@ -72,7 +72,8 @@ def _validate(data: dict):
     if not isinstance(raw_windows, list) or not raw_windows:
         return None
 
-    time_re = re.compile(r'^([01]?\d|2[0-3]):[0-5]\d$')
+    # Разрешаем также 24:00 — в объявлениях «до 24:00» означает полночь
+    time_re = re.compile(r'^(([01]?\d|2[0-3]):[0-5]\d|24:00)$')
 
     def norm(t: str) -> str:
         h, m = t.split(':')
