@@ -185,7 +185,9 @@ class LLMExtractor:
                 json={
                     'model': self.model,
                     'temperature': 0,
-                    'max_tokens': 400,
+                    # С запасом: reasoning-модели (gpt-5-*) тратят часть лимита на
+                    # внутренние рассуждения; при малом лимите видимый ответ пустой.
+                    'max_tokens': 1500,
                     'messages': [
                         {'role': 'system', 'content': SYSTEM_PROMPT},
                         {'role': 'user', 'content': post_text},
@@ -203,7 +205,9 @@ class LLMExtractor:
             return None
 
         try:
-            content = payload['choices'][0]['message']['content']
+            choice = payload['choices'][0]
+            content = choice['message']['content']
+            finish_reason = choice.get('finish_reason')
         except (KeyError, IndexError, TypeError):
             logger.error(f"Неожиданный ответ LLM: {str(payload)[:300]}")
             return None
@@ -211,7 +215,11 @@ class LLMExtractor:
         data = _parse_json(content)
         result = _validate(data)
         if result is None:
-            logger.error(f"LLM вернул невалидную структуру. Ответ: {content[:300]}")
+            # finish_reason='length' + пустой content = модель упёрлась в лимит токенов
+            logger.error(
+                f"LLM вернул невалидную структуру (finish_reason={finish_reason}). "
+                f"Ответ: {content[:300]!r}"
+            )
         return result
 
     async def close(self):
