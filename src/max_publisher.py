@@ -2,24 +2,51 @@
 Публикация через MAX Messenger Bot API.
 Используется для параллельной публикации алертов в канал MAX.
 """
+import ssl
+from pathlib import Path
+
 import aiohttp
 from .logger import setup_logger
 
 logger = setup_logger('max_publisher')
 
+# Сертификат Минцифры (Russian Trusted Root CA). Новый домен MAX API
+# platform-api2.max.ru отдаёт TLS-сертификат, выпущенный национальным УЦ
+# Минцифры, которого нет в стандартном trust store. Доверие ограничено
+# только этим SSL-контекстом (только запросы к MAX), системный trust не меняем.
+_MINCIFRY_ROOT_CA = (
+    Path(__file__).resolve().parent.parent / 'certs' / 'russian_trusted_root_ca.pem'
+)
+
 
 class MaxPublisher:
-    BASE_URL = 'https://platform-api.max.ru'
+    BASE_URL = 'https://platform-api2.max.ru'
 
     def __init__(self, bot_token: str, target_channel: str):
         self.bot_token = bot_token
         self.target_channel = target_channel
         self._session: aiohttp.ClientSession = None
+        self._ssl_context: ssl.SSLContext = None
+
+    def _get_ssl_context(self) -> ssl.SSLContext:
+        if self._ssl_context is None:
+            ctx = ssl.create_default_context()
+            if _MINCIFRY_ROOT_CA.exists():
+                ctx.load_verify_locations(cafile=str(_MINCIFRY_ROOT_CA))
+            else:
+                logger.error(
+                    f"Сертификат Минцифры не найден: {_MINCIFRY_ROOT_CA}. "
+                    "TLS к MAX API может не установиться."
+                )
+            self._ssl_context = ctx
+        return self._ssl_context
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
+            connector = aiohttp.TCPConnector(ssl=self._get_ssl_context())
             self._session = aiohttp.ClientSession(
-                headers={'Authorization': self.bot_token}
+                headers={'Authorization': self.bot_token},
+                connector=connector
             )
         return self._session
 
