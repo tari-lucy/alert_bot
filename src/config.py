@@ -28,6 +28,12 @@ class Config:
     # Обратная совместимость (старый KEYWORDS_FILE)
     KEYWORDS_FILE = os.getenv('KEYWORDS_FILE', KEYWORDS_ALERT_FILE)
 
+    # Защита от дублей: не публиковать тот же шаблон повторно в этом окне.
+    # Источник иногда постит тревогу/отбой двумя одинаковыми сообщениями
+    # подряд (разные ID, разница ~1 сек). Окно много меньше реального
+    # интервала между разными тревогами, так что повторную не теряем.
+    ALERT_DEDUP_SECONDS = int(os.getenv('ALERT_DEDUP_SECONDS', '180'))
+
     # Гибридный режим: использовать Bot API для публикации (опционально)
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')  # Если указан - публикация через Bot API
     USE_BOT_FOR_PUBLISHING = bool(BOT_TOKEN)

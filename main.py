@@ -58,6 +58,7 @@ class AlertBot:
             clear_keywords_file=Config.KEYWORDS_CLEAR_FILE
         )
         self._skip_old = True  # При старте фильтруем старые посты
+        self._last_published = {}  # шаблон -> время последней публикации (дедуп)
 
         # Второй источник — канал энергетиков (опционально)
         self.energy_parser = None
@@ -195,6 +196,14 @@ class AlertBot:
                     f"Текст: '{message.text[:100]}...'"
                 )
 
+                if self._is_duplicate_template(Config.ALERT_TEMPLATE):
+                    logger.warning(
+                        f"Пост {message.id}: тревога уже опубликована только что "
+                        f"(источник повторил пост) — не дублируем"
+                    )
+                    await self.storage.mark_processed(message.id)
+                    continue
+
                 # Публикуем шаблон ТРЕВОГИ
                 success = await self.publish_to_all(
                     template_text=Config.ALERT_TEMPLATE,
@@ -202,6 +211,7 @@ class AlertBot:
                 )
 
                 if success:
+                    self._last_published[Config.ALERT_TEMPLATE] = datetime.now()
                     await self.storage.mark_processed(message.id)
                     new_posts_count += 1
                     logger.info(f"Тревога успешно опубликована для поста {message.id}")
@@ -214,6 +224,14 @@ class AlertBot:
                     f"Текст: '{message.text[:100]}...'"
                 )
 
+                if self._is_duplicate_template(Config.CLEAR_TEMPLATE):
+                    logger.warning(
+                        f"Пост {message.id}: отбой уже опубликован только что "
+                        f"(источник повторил пост) — не дублируем"
+                    )
+                    await self.storage.mark_processed(message.id)
+                    continue
+
                 # Публикуем шаблон ОТБОЯ
                 success = await self.publish_to_all(
                     template_text=Config.CLEAR_TEMPLATE,
@@ -221,6 +239,7 @@ class AlertBot:
                 )
 
                 if success:
+                    self._last_published[Config.CLEAR_TEMPLATE] = datetime.now()
                     await self.storage.mark_processed(message.id)
                     new_posts_count += 1
                     logger.info(f"Отбой успешно опубликован для поста {message.id}")
@@ -243,6 +262,21 @@ class AlertBot:
 
         if filtered_posts_count > 0:
             logger.debug(f"Отфильтровано постов (не совпали): {filtered_posts_count}")
+
+    def _is_duplicate_template(self, template_text: str) -> bool:
+        """
+        True, если такой же шаблон уже публиковался меньше окна дедупа назад.
+
+        С 16.07.2026 источник иногда публикует тревогу/отбой двумя одинаковыми
+        сообщениями подряд (разные message_id, разница ~1 сек) — дедуп по ID их
+        не ловит, и в канал уходили два одинаковых поста. Ключ — публикуемый
+        шаблон, а не текст источника: шаблон фиксирован, поэтому даже слегка
+        разные посты дают на выходе одно и то же сообщение.
+        """
+        last = self._last_published.get(template_text)
+        if last is None:
+            return False
+        return datetime.now() - last < timedelta(seconds=Config.ALERT_DEDUP_SECONDS)
 
     async def _publish_energy(self, extraction: dict, message_id: int, post_text: str = '') -> int:
         """Собирает и публикует посты из результата извлечения. Возвращает число опубликованных."""
