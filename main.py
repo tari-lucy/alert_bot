@@ -281,11 +281,15 @@ class AlertBot:
         for message in reversed(messages):
             if self.storage.is_processed(message.id, channel):
                 continue
-            if not message.text:
+            # raw_text — текст без разметки. У message.text парс-мод Telethon
+            # подставляет markdown-маркеры entity исходного поста (__курсив__,
+            # **жирный**), и они попадали бы в публикацию обычными символами.
+            post_text = message.raw_text
+            if not post_text:
                 # Текст может появиться позже — не помечаем обработанным
                 continue
 
-            extraction = await self.llm_extractor.extract(message.text)
+            extraction = await self.llm_extractor.extract(post_text)
 
             if extraction is None:
                 # Ошибка сети/модели/валидации — ретраим ограниченное число раз
@@ -297,7 +301,7 @@ class AlertBot:
                     await self.notify_admin(
                         f"[AlertBot] {now}\n"
                         f"Не удалось разобрать энергопост {message.id} за {attempts} попытки. "
-                        f"Проверьте вручную:\n{message.text[:400]}"
+                        f"Проверьте вручную:\n{post_text[:400]}"
                     )
                     await self.storage.mark_processed(message.id, channel)
                     self._energy_attempts.pop(message.id, None)
@@ -318,24 +322,24 @@ class AlertBot:
                 continue
 
             # Сверка извлечённых данных с текстом поста (защита от ошибок модели)
-            ok, reason = verify_outage(extraction, message.text)
+            ok, reason = verify_outage(extraction, post_text)
             if not ok:
                 logger.warning(f"Энергопост {message.id}: сверка не прошла ({reason}) — на ручную модерацию")
                 draft = "\n\n— — —\n\n".join(
-                    self.energy_formatter.build_messages(extraction, message.text)
+                    self.energy_formatter.build_messages(extraction, post_text)
                 )
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 await self.notify_admin(
                     f"[AlertBot] {now}\n"
                     f"Энергопост {message.id}: сверка не прошла ({reason}). "
                     f"Не опубликовано, проверьте вручную.\n\n"
-                    f"ИСХОДНЫЙ ПОСТ:\n{message.text[:600]}\n\n"
+                    f"ИСХОДНЫЙ ПОСТ:\n{post_text[:600]}\n\n"
                     f"ЧЕРНОВИК БОТА:\n{draft[:800]}"
                 )
                 await self.storage.mark_processed(message.id, channel)
                 continue
 
-            published = await self._publish_energy(extraction, message.id, message.text)
+            published = await self._publish_energy(extraction, message.id, post_text)
             if published > 0:
                 await self.storage.mark_processed(message.id, channel)
                 logger.info(f"Энергопост {message.id}: опубликовано сообщений: {published} (тип {extraction['type']})")
