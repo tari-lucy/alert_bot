@@ -40,8 +40,8 @@ class Config:
     # Второй источник — канал энергетиков (Севастопольэнерго): отключения по очередям.
     # Посты преобразуются через LLM и публикуются в те же цели (TG + MAX).
     ENERGY_SOURCE_CHANNEL = os.getenv('ENERGY_SOURCE_CHANNEL', '')
-    QUEUE_1_ADDRESSES_FILE = os.getenv('QUEUE_1_ADDRESSES_FILE', 'data/queue_1_addresses.txt')
-    QUEUE_2_ADDRESSES_FILE = os.getenv('QUEUE_2_ADDRESSES_FILE', 'data/queue_2_addresses.txt')
+    # Адреса берутся дословно из самого поста Севастопольэнерго (см. energy_formatter),
+    # локальные списки по очередям больше не используются.
     # Подпись источника в публикуемых энергопостах (текстом, без ссылки)
     ENERGY_SOURCE_NAME = os.getenv('ENERGY_SOURCE_NAME', 'Севастопольэнерго')
 

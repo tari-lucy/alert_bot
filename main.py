@@ -75,10 +75,6 @@ class AlertBot:
                 model=Config.LLM_MODEL,
             )
             self.energy_formatter = EnergyFormatter(
-                queue_address_files={
-                    1: Config.QUEUE_1_ADDRESSES_FILE,
-                    2: Config.QUEUE_2_ADDRESSES_FILE,
-                },
                 source_name=Config.ENERGY_SOURCE_NAME,
             )
 
@@ -248,10 +244,10 @@ class AlertBot:
         if filtered_posts_count > 0:
             logger.debug(f"Отфильтровано постов (не совпали): {filtered_posts_count}")
 
-    async def _publish_energy(self, extraction: dict, message_id: int) -> int:
+    async def _publish_energy(self, extraction: dict, message_id: int, post_text: str = '') -> int:
         """Собирает и публикует посты из результата извлечения. Возвращает число опубликованных."""
         published = 0
-        for text in self.energy_formatter.build_messages(extraction):
+        for text in self.energy_formatter.build_messages(extraction, post_text):
             if text in self._energy_recent:
                 logger.info(f"Энергопост {message_id}: дубль контента, пропуск")
                 continue
@@ -325,7 +321,9 @@ class AlertBot:
             ok, reason = verify_outage(extraction, message.text)
             if not ok:
                 logger.warning(f"Энергопост {message.id}: сверка не прошла ({reason}) — на ручную модерацию")
-                draft = "\n\n— — —\n\n".join(self.energy_formatter.build_messages(extraction))
+                draft = "\n\n— — —\n\n".join(
+                    self.energy_formatter.build_messages(extraction, message.text)
+                )
                 now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 await self.notify_admin(
                     f"[AlertBot] {now}\n"
@@ -337,7 +335,7 @@ class AlertBot:
                 await self.storage.mark_processed(message.id, channel)
                 continue
 
-            published = await self._publish_energy(extraction, message.id)
+            published = await self._publish_energy(extraction, message.id, message.text)
             if published > 0:
                 await self.storage.mark_processed(message.id, channel)
                 logger.info(f"Энергопост {message.id}: опубликовано сообщений: {published} (тип {extraction['type']})")
