@@ -12,7 +12,7 @@ from src.bot_publisher import BotPublisher
 from src.max_publisher import MaxPublisher
 from src.storage import PostStorage
 from src.filter import TextFilter
-from src.llm_extractor import LLMExtractor, verify_outage
+from src.llm_extractor import LLMExtractor, verify_windows
 from src.energy_formatter import EnergyFormatter
 from src.logger import setup_logger
 
@@ -355,8 +355,13 @@ class AlertBot:
                 await self.storage.mark_processed(message.id, channel)
                 continue
 
+            if extraction['type'] == 'supply' and not Config.ENERGY_SUPPLY_ENABLED:
+                logger.info(f"Энергопост {message.id}: 'подача света' отключена настройкой — не публикуем")
+                await self.storage.mark_processed(message.id, channel)
+                continue
+
             # Сверка извлечённых данных с текстом поста (защита от ошибок модели)
-            ok, reason = verify_outage(extraction, post_text)
+            ok, reason = verify_windows(extraction, post_text)
             if not ok:
                 logger.warning(f"Энергопост {message.id}: сверка не прошла ({reason}) — на ручную модерацию")
                 draft = "\n\n— — —\n\n".join(

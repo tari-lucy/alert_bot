@@ -193,13 +193,8 @@ class EnergyFormatter:
             return f'<i>Об этом сообщило «{self.source_name}».</i>'
         return ''
 
-    def format_outage(self, queue: int, time_from, time_to: str, confirmed: bool,
-                      addresses: str = None) -> str:
-        if confirmed:
-            header = f"🔌 <b>Отключение электроэнергии — {queue} очередь</b>"
-        else:
-            header = f"⚠️ <b>Ожидается отключение электроэнергии — {queue} очередь</b>"
-
+    def _format_window(self, header: str, addresses_title: str, queue: int,
+                       time_from, time_to: str, addresses: str = None) -> str:
         time_line = f"🕐 {time_from}–{time_to}" if time_from else f"🕐 До {time_to}"
         parts = [header, "", time_line]
 
@@ -210,8 +205,31 @@ class EnergyFormatter:
         if not addresses:
             return "\n".join(parts)
 
-        parts += ["", f"<b>Адреса отключения ({queue} очередь):</b>"]
+        parts += ["", f"<b>{addresses_title} ({queue} очередь):</b>"]
         return _fit(parts, addresses)
+
+    def format_outage(self, queue: int, time_from, time_to: str, confirmed: bool,
+                      addresses: str = None) -> str:
+        if confirmed:
+            header = f"🔌 <b>Отключение электроэнергии — {queue} очередь</b>"
+        else:
+            header = f"⚠️ <b>Ожидается отключение электроэнергии — {queue} очередь</b>"
+        return self._format_window(
+            header, "Адреса отключения", queue, time_from, time_to, addresses
+        )
+
+    def format_supply(self, queue: int, time_from, time_to: str,
+                      addresses: str = None) -> str:
+        """
+        Пост «где свет БУДЕТ» — антипод отключения.
+
+        Источник пишет «ориентировочно будет», гарантии он не даёт, поэтому
+        и заголовок не обещает твёрдо.
+        """
+        header = f"💡 <b>Ориентировочно будет свет — {queue} очередь</b>"
+        return self._format_window(
+            header, "Адреса", queue, time_from, time_to, addresses
+        )
 
     def format_lifted(self) -> str:
         source = self._source_line()
@@ -226,15 +244,21 @@ class EnergyFormatter:
         msg_type = extraction.get('type')
         if msg_type == 'lifted':
             return [self.format_lifted()]
-        if msg_type == 'outage':
-            confirmed = extraction.get('confirmed', False)
-            messages = []
-            for w in extraction.get('windows', []):
-                addresses = extract_addresses(post_text, w['queue'])
-                if not addresses:
-                    logger.warning(f"Адреса для очереди {w['queue']} не извлечены — пост без адресов")
+        if msg_type not in ('outage', 'supply'):
+            return []
+
+        confirmed = extraction.get('confirmed', False)
+        messages = []
+        for w in extraction.get('windows', []):
+            addresses = extract_addresses(post_text, w['queue'])
+            if not addresses:
+                logger.warning(f"Адреса для очереди {w['queue']} не извлечены — пост без адресов")
+            if msg_type == 'supply':
+                messages.append(
+                    self.format_supply(w['queue'], w['from'], w['to'], addresses)
+                )
+            else:
                 messages.append(
                     self.format_outage(w['queue'], w['from'], w['to'], confirmed, addresses)
                 )
-            return messages
-        return []
+        return messages

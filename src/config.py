@@ -56,6 +56,10 @@ class Config:
     # Графики отключений публикуются всегда.
     ENERGY_LIFTED_ENABLED = os.getenv('ENERGY_LIFTED_ENABLED', 'false').lower() == 'true'
 
+    # Публиковать посты «где свет БУДЕТ» (supply) — источник сообщает, каким
+    # очередям и когда ориентировочно дадут свет. Включено: людям это полезно.
+    ENERGY_SUPPLY_ENABLED = os.getenv('ENERGY_SUPPLY_ENABLED', 'true').lower() == 'true'
+
     # LLM (vsellm.ru — OpenAI-совместимый шлюз) для извлечения структуры из энергопостов
     LLM_API_KEY = os.getenv('LLM_API_KEY', '')
     LLM_BASE_URL = os.getenv('LLM_BASE_URL', 'https://api.vsellm.ru/v1')
