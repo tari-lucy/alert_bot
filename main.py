@@ -12,7 +12,7 @@ from src.bot_publisher import BotPublisher
 from src.max_publisher import MaxPublisher
 from src.storage import PostStorage
 from src.filter import TextFilter
-from src.llm_extractor import LLMExtractor, verify_windows
+from src.llm_extractor import LLMExtractor, verify_windows, is_gvo_post
 from src.energy_formatter import EnergyFormatter
 from src.logger import setup_logger
 
@@ -315,12 +315,27 @@ class AlertBot:
         for message in reversed(messages):
             if self.storage.is_processed(message.id, channel):
                 continue
+            # Репосты не наши: канал иногда пересылает Развожаева, а он тоже
+            # пишет про отключения — такой пост прошёл бы фильтр по словам.
+            if message.fwd_from:
+                logger.debug(f"Энергопост {message.id}: репост — пропускаем")
+                await self.storage.mark_processed(message.id, channel)
+                continue
+
             # raw_text — текст без разметки. У message.text парс-мод Telethon
             # подставляет markdown-маркеры entity исходного поста (__курсив__,
             # **жирный**), и они попадали бы в публикацию обычными символами.
             post_text = message.raw_text
             if not post_text:
                 # Текст может появиться позже — не помечаем обработанным
+                continue
+
+            # Предохранитель: публикуем только посты про график временных
+            # ограничений. Стоит ДО LLM — модель не может его обойти, а на
+            # ремонты/аварии/вакансии запрос к ней даже не уходит.
+            if not is_gvo_post(post_text):
+                logger.debug(f"Энергопост {message.id}: не про ГВО — пропускаем")
+                await self.storage.mark_processed(message.id, channel)
                 continue
 
             extraction = await self.llm_extractor.extract(post_text)
@@ -357,6 +372,11 @@ class AlertBot:
 
             if extraction['type'] == 'supply' and not Config.ENERGY_SUPPLY_ENABLED:
                 logger.info(f"Энергопост {message.id}: 'подача света' отключена настройкой — не публикуем")
+                await self.storage.mark_processed(message.id, channel)
+                continue
+
+            if extraction['type'] == 'regime' and not Config.ENERGY_REGIME_ENABLED:
+                logger.info(f"Энергопост {message.id}: 'объявление режима' отключено настройкой — не публикуем")
                 await self.storage.mark_processed(message.id, channel)
                 continue
 
