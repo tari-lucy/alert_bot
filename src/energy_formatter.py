@@ -218,52 +218,50 @@ def _prepare_addresses(block: str) -> str:
     )
 
 
-def _render(parts: list, addresses: str) -> str:
-    """Готовое сообщение: шапка/время/источник + размеченный блок адресов + сноска."""
-    return "\n".join(parts + ["", _prepare_addresses(addresses), "", _ADDRESSES_NOTE])
+def _boundary_len(text: str, n: int) -> int:
+    """Длина префикса ≤ n, обрезанного по последней запятой/переносу (адрес цел)."""
+    cut = text[:n]
+    b = max(cut.rfind(','), cut.rfind('\n'))
+    return (b + 1) if b > 0 else n
 
 
-def _fit(parts: list, addresses: str) -> str:
+def _split_address_chunks(fixed_lines: list, addresses: str) -> list:
     """
-    Собирает текст, укладываясь в лимит сообщения.
+    Режет блок адресов на куски так, чтобы каждый кусок В СОБРАННОМ виде
+    влезал в лимит сообщения. Ни один адрес не теряется — длинные простыни
+    публикуются несколькими частями.
 
-    Подрезаем ИСХОДНЫЙ текст (по запятой/переносу, чтобы не оборвать адрес и
-    не разорвать HTML-тег), но границу ищем по ФАКТИЧЕСКИ отрендеренной длине:
-    разметка (<i> на абзац) и экранирование меняют длину непредсказуемо, и
-    арифметика по сырой длине ошибалась (MAX API отклонял 4060 > 4000).
+    fixed_lines — заведомо худший набор служебных строк (шапка + метка части +
+    время + источник + подзаголовок + сноска), чтобы бюджет куска был с запасом
+    для любой реальной части. Границу куска ищем по ФАКТИЧЕСКИ отрендеренной
+    длине: разметка (<i> на абзац) и экранирование меняют длину непредсказуемо.
     """
-    text = _render(parts, addresses)
-    if len(text) <= MAX_MESSAGE_LEN:
-        return text
+    def fits(chunk: str) -> bool:
+        rendered = "\n".join(fixed_lines + ["", _prepare_addresses(chunk), "", _ADDRESSES_NOTE])
+        return len(rendered) <= MAX_MESSAGE_LEN
 
-    tail = "…"
-
-    def cut_to(n: int) -> str:
-        """Префикс адресов длиной ~n, обрезанный по последней запятой/переносу."""
-        cut = addresses[:n]
-        boundary = max(cut.rfind(','), cut.rfind('\n'))
-        if boundary > 0:
-            cut = cut[:boundary]
-        return cut.rstrip(' ,\n') + tail
-
-    # Двоичный поиск наибольшего префикса, чей ГОТОВЫЙ текст влезает в лимит.
-    # Отрендеренная длина монотонна по длине префикса, поэтому поиск корректен.
-    lo, hi, best = 0, len(addresses), None
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        rendered = _render(parts, cut_to(mid))
-        if len(rendered) <= MAX_MESSAGE_LEN:
-            best = rendered
-            lo = mid + 1
-        else:
-            hi = mid - 1
-
-    if best is None:
-        logger.warning("Не хватает места даже под урезанные адреса — публикуем без них")
-        return "\n".join(parts)
-
-    logger.info(f"Адреса подрезаны под лимит сообщения ({MAX_MESSAGE_LEN})")
-    return best
+    chunks = []
+    remaining = addresses.strip()
+    while remaining:
+        if fits(remaining):
+            chunks.append(remaining)
+            break
+        lo, hi, best_n = 1, len(remaining), 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            blen = _boundary_len(remaining, mid)
+            if blen and fits(remaining[:blen].rstrip(' ,\n')):
+                best_n = blen
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best_n == 0:
+            # Даже минимальный кусок не влезает (аномально длинный адрес без
+            # запятых) — берём по границе, чтобы не зациклиться и не потерять.
+            best_n = _boundary_len(remaining, len(remaining))
+        chunks.append(remaining[:best_n].rstrip(' ,\n'))
+        remaining = remaining[best_n:].lstrip(' ,\n')
+    return chunks
 
 
 class EnergyFormatter:
@@ -303,24 +301,54 @@ class EnergyFormatter:
         return line
 
     def _format_window(self, header: str, addresses_title: str, queue,
-                       time_from, time_to, restore=None, addresses: str = None) -> str:
-        parts = [header]
-
+                       time_from, time_to, restore=None, addresses: str = None) -> list:
+        """Список готовых сообщений. Длинные адреса — несколькими частями."""
         time_line = self._time_line(time_from, time_to, restore)
-        if time_line:
-            parts += ["", time_line]
-
         source = self._source_line()
-        if source:
-            parts += ["", source]
 
         if not addresses:
-            return "\n".join(parts)
+            parts = [header]
+            if time_line:
+                parts += ["", time_line]
+            if source:
+                parts += ["", source]
+            return ["\n".join(parts)]
 
         # Очередь в подзаголовке — только если она в посте реально названа
         suffix = f" ({queue} очередь)" if queue else ""
-        parts += ["", f"<b>{addresses_title}{suffix}:</b>"]
-        return _fit(parts, addresses)
+        title = f"<b>{addresses_title}{suffix}:</b>"
+
+        # Худший набор служебных строк для бюджета куска: шапка с меткой части,
+        # время, источник, подзаголовок. Реальные части ≤ этого, значит влезут.
+        worst_lines = [f"{header}  (часть 0/0)"]
+        if time_line:
+            worst_lines += ["", time_line]
+        if source:
+            worst_lines += ["", source]
+        worst_lines += ["", f"<b>{addresses_title}{suffix} (продолжение):</b>"]
+
+        chunks = _split_address_chunks(worst_lines, addresses)
+        total = len(chunks)
+        if total > 1:
+            logger.info(f"Адреса не влезают в одно сообщение — публикуем {total} частями")
+
+        messages = []
+        for i, chunk in enumerate(chunks, 1):
+            label = f"  (часть {i}/{total})" if total > 1 else ""
+            parts = [f"{header}{label}"]
+            if i == 1:
+                # Время и источник — только на первой части
+                if time_line:
+                    parts += ["", time_line]
+                if source:
+                    parts += ["", source]
+            cont = " (продолжение)" if i > 1 else ""
+            parts += ["", f"<b>{addresses_title}{suffix}{cont}:</b>", "", _prepare_addresses(chunk)]
+            if i == total:
+                # Сноска «список может быть неполным» — только на последней части
+                parts += ["", _ADDRESSES_NOTE]
+            messages.append("\n".join(parts))
+        return messages
 
     def _queue_suffix(self, queue, partial: bool) -> str:
         """
@@ -336,7 +364,7 @@ class EnergyFormatter:
         return f" — {queue} очередь"
 
     def format_outage(self, queue, time_from, time_to, confirmed: bool,
-                      restore=None, addresses: str = None, partial: bool = False) -> str:
+                      restore=None, addresses: str = None, partial: bool = False) -> list:
         """Отключение в рамках ГВО. queue=None — отключение без номера очереди."""
         suffix = self._queue_suffix(queue, partial)
         if confirmed:
@@ -348,7 +376,7 @@ class EnergyFormatter:
         )
 
     def format_supply(self, queue, time_from, time_to, restore=None,
-                      addresses: str = None, partial: bool = False) -> str:
+                      addresses: str = None, partial: bool = False) -> list:
         """
         Пост «где свет БУДЕТ» — антипод отключения.
 
@@ -416,12 +444,12 @@ class EnergyFormatter:
                 )
             partial = is_partial_queue(post_text, queue)
             if msg_type == 'supply':
-                messages.append(
+                messages.extend(
                     self.format_supply(queue, w.get('from'), w.get('to'),
                                        w.get('restore'), addresses, partial)
                 )
             else:
-                messages.append(
+                messages.extend(
                     self.format_outage(queue, w.get('from'), w.get('to'), confirmed,
                                        w.get('restore'), addresses, partial)
                 )
