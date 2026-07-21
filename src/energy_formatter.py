@@ -36,10 +36,15 @@ _FOOTER_RE = re.compile(r'\n?\s*\*\s*Список\s+адресов.*$', re.S | r
 # после слова «очередь», что позволяет забрать адреса и с той же строки.
 _QUEUE_DECL_RE = re.compile(r'(\d)\s*-?\s*(?:[а-я]{1,3}\s*)?очеред(?:и|ь|ей|ью)?', re.I)
 
-# Признаки того, что вырезанный блок — действительно адреса, а не проза
+# Признаки того, что абзац — действительно адреса, а не хвостовая проза
+# («Энергетики делают всё возможное…», «По возможности включим…»). Список
+# намеренно широкий, включая нежилые объекты, чтобы не срезать реальную строку.
+# Аббревиатуры-объекты — только как отдельные слова (\b), иначе «СК» ловит
+# «Гагарин[ск]ого», «АО» — «[ао]» внутри слов, и хвостовая проза не отсекается.
 _ADDRESS_MARKER_RE = re.compile(
-    r'(ул\.|ул\s|пос\.|просп|пр\.|пер\.|наб\.|пл\.|с\.|г\.|п\.|х\.|хут|'
-    r'шоссе|бухта|балка|мыс|\bкм\b|бульв|ЖК|ЖСК|СК|ООО|АО)', re.I
+    r'(ул\.|ул\s|пос\.|просп|пр\.|пр-кт|пр-д|пер\.|наб\.|пл\.|\bс\.|\bг\.|\bп\.|\bх\.|хут|'
+    r'шоссе|бухта|балка|мыс|\bкм\b|бульв|причал|завод|з-д|'
+    r'\bЖК\b|\bЖСК\b|\bЖСТ\b|\bЖЗС\b|\bСНТ\b|\bСТ\b|\bСК\b|\bООО\b|\bАО\b|\bЗАО\b|\bИП\b|\bТЦ\b)', re.I
 )
 
 _ADDRESSES_NOTE = "<i>*Список адресов может быть неполным.</i>"
@@ -142,6 +147,21 @@ def _addresses_without_queue(post_text: str):
     return "\n".join(paragraphs)
 
 
+def _strip_trailing_prose(block: str) -> str:
+    """
+    Отсекает хвостовые НЕадресные абзацы блока.
+
+    После адресов источник иногда дописывает общие фразы («Энергетики делают
+    всё возможное…», «По возможности включим…»). Они не адреса — убираем их с
+    конца, чтобы блок заканчивался на последнем адресе. Внутренние абзацы не
+    трогаем: срезаем только пока последний абзац не похож на адреса.
+    """
+    paragraphs = _split_paragraphs(block)
+    while paragraphs and not _ADDRESS_MARKER_RE.search(paragraphs[-1]):
+        paragraphs.pop()
+    return "\n\n".join(paragraphs)
+
+
 def extract_addresses(post_text: str, queue: int = None):
     """
     Дословный блок адресов или None.
@@ -156,24 +176,24 @@ def extract_addresses(post_text: str, queue: int = None):
 
     if queue is None:
         block = _addresses_without_queue(post_text)
-        if not block:
+    else:
+        blocks = _segments_by_queue(post_text).get(queue) or []
+        if len(blocks) != 1:
+            if len(blocks) > 1:
+                logger.warning(
+                    f"Очередь {queue} объявлена в посте {len(blocks)} раза — "
+                    "привязка адресов неоднозначна, публикуем без адресов"
+                )
             return None
-        if len(block) < 20 or not _ADDRESS_MARKER_RE.search(block):
-            return None
-        return block
+        block = blocks[0]
 
-    blocks = _segments_by_queue(post_text).get(queue) or []
-    if len(blocks) != 1:
-        if len(blocks) > 1:
-            logger.warning(
-                f"Очередь {queue} объявлена в посте {len(blocks)} раза — "
-                "привязка адресов неоднозначна, публикуем без адресов"
-            )
+    if not block:
         return None
-
-    block = blocks[0]
+    # Хвостовая проза после адресов («Энергетики делают всё возможное…») — прочь.
+    block = _strip_trailing_prose(block)
     if len(block) < 20 or not _ADDRESS_MARKER_RE.search(block):
-        logger.warning(f"Блок после объявления очереди {queue} не похож на адреса — публикуем без них")
+        if queue is not None:
+            logger.warning(f"Блок после объявления очереди {queue} не похож на адреса — публикуем без них")
         return None
     return block
 
