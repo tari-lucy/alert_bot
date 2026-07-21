@@ -218,33 +218,52 @@ def _prepare_addresses(block: str) -> str:
     )
 
 
+def _render(parts: list, addresses: str) -> str:
+    """Готовое сообщение: шапка/время/источник + размеченный блок адресов + сноска."""
+    return "\n".join(parts + ["", _prepare_addresses(addresses), "", _ADDRESSES_NOTE])
+
+
 def _fit(parts: list, addresses: str) -> str:
     """
-    Собирает текст, укладываясь в лимит: при нужде подрезает адреса по запятой.
+    Собирает текст, укладываясь в лимит сообщения.
 
-    Подрезаем ИСХОДНЫЙ текст и только потом накладываем разметку — иначе
-    обрезка могла бы разорвать HTML-тег и сломать публикацию.
+    Подрезаем ИСХОДНЫЙ текст (по запятой/переносу, чтобы не оборвать адрес и
+    не разорвать HTML-тег), но границу ищем по ФАКТИЧЕСКИ отрендеренной длине:
+    разметка (<i> на абзац) и экранирование меняют длину непредсказуемо, и
+    арифметика по сырой длине ошибалась (MAX API отклонял 4060 > 4000).
     """
-    text = "\n".join(parts + ["", _prepare_addresses(addresses), "", _ADDRESSES_NOTE])
+    text = _render(parts, addresses)
     if len(text) <= MAX_MESSAGE_LEN:
         return text
 
     tail = "…"
-    # Всё, кроме самих адресов: шапка, сноска, разметка, экранирование.
-    # После обрезки абзацев станет меньше, значит запас только вырастет.
-    overhead = len(text) - len(addresses) + len(tail)
-    room = MAX_MESSAGE_LEN - overhead
-    if room < 200:
+
+    def cut_to(n: int) -> str:
+        """Префикс адресов длиной ~n, обрезанный по последней запятой/переносу."""
+        cut = addresses[:n]
+        boundary = max(cut.rfind(','), cut.rfind('\n'))
+        if boundary > 0:
+            cut = cut[:boundary]
+        return cut.rstrip(' ,\n') + tail
+
+    # Двоичный поиск наибольшего префикса, чей ГОТОВЫЙ текст влезает в лимит.
+    # Отрендеренная длина монотонна по длине префикса, поэтому поиск корректен.
+    lo, hi, best = 0, len(addresses), None
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        rendered = _render(parts, cut_to(mid))
+        if len(rendered) <= MAX_MESSAGE_LEN:
+            best = rendered
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    if best is None:
         logger.warning("Не хватает места даже под урезанные адреса — публикуем без них")
         return "\n".join(parts)
 
-    cut = addresses[:room]
-    boundary = max(cut.rfind(','), cut.rfind('\n'))
-    if boundary > room // 2:
-        cut = cut[:boundary]
-    cut = cut.rstrip(' ,\n') + tail
-    logger.info(f"Адреса подрезаны под лимит сообщения: {len(addresses)} → {len(cut)} символов")
-    return "\n".join(parts + ["", _prepare_addresses(cut), "", _ADDRESSES_NOTE])
+    logger.info(f"Адреса подрезаны под лимит сообщения ({MAX_MESSAGE_LEN})")
+    return best
 
 
 class EnergyFormatter:
