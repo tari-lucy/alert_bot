@@ -44,8 +44,14 @@ _ADDRESS_MARKER_RE = re.compile(
 
 _ADDRESSES_NOTE = "<i>*Список адресов может быть неполным.</i>"
 
-# Запас под лимит сообщения (Telegram — 4096, MAX — свой; берём с запасом)
+# Лимит сообщения. MAX = 4000, Telegram = 4096; берём строгий, тогда влезает в оба.
 MAX_MESSAGE_LEN = 4000
+
+# Потолок числа частей на один пост. Реальные посты укладываются в 1-2 части;
+# ограничение — страховка от аномально длинных «простыней», чтобы не слать
+# десяток сообщений подряд. При переполнении хвост адресов заменяется ссылкой
+# на первоисточник.
+MAX_PARTS = 3
 
 _BLANK_LINE_RE = re.compile(r'\n\s*\n')
 
@@ -277,6 +283,12 @@ class EnergyFormatter:
             return f'<i>Об этом сообщило «{self.source_name}».</i>'
         return ''
 
+    def _source_pointer(self) -> str:
+        """Ссылка на первоисточник за полным списком (для очень длинных постов)."""
+        if self.source_name:
+            return f'<i>Полный список адресов — в канале «{self.source_name}».</i>'
+        return '<i>Полный список адресов — в первоисточнике.</i>'
+
     def _time_line(self, time_from, time_to, restore=None):
         """
         Строка времени из того, что реально написано в посте.
@@ -318,20 +330,32 @@ class EnergyFormatter:
         suffix = f" ({queue} очередь)" if queue else ""
         title = f"<b>{addresses_title}{suffix}:</b>"
 
-        # Худший набор служебных строк для бюджета куска: шапка с меткой части,
-        # время, источник, подзаголовок. Реальные части ≤ этого, значит влезут.
-        worst_lines = [f"{header}  (часть 0/0)"]
+        # Худший набор служебных строк для бюджета куска: шапка с САМОЙ ШИРОКОЙ
+        # меткой части (двузначные/трёхзначные номера дают 1-2 лишних символа),
+        # время, источник, подзаголовок-продолжение, сноска. Любая реальная
+        # часть короче этого, значит гарантированно влезет в лимит.
+        worst_lines = [f"{header}  (часть 999/999)"]
         if time_line:
             worst_lines += ["", time_line]
         if source:
             worst_lines += ["", source]
         worst_lines += ["", f"<b>{addresses_title}{suffix} (продолжение):</b>"]
 
+        pointer = self._source_pointer()
         chunks = _split_address_chunks(worst_lines, addresses)
-        total = len(chunks)
-        if total > 1:
-            logger.info(f"Адреса не влезают в одно сообщение — публикуем {total} частями")
+        overflow = len(chunks) > MAX_PARTS
+        if overflow:
+            # Пост аномально длинный: режем до MAX_PARTS, зарезервировав на
+            # последней части место под ссылку на первоисточник.
+            chunks = _split_address_chunks(worst_lines + ["", pointer], addresses)[:MAX_PARTS]
+            logger.warning(
+                f"Пост длиннее {MAX_PARTS} частей — публикуем {MAX_PARTS}, "
+                "остальные адреса — ссылкой на первоисточник"
+            )
+        elif len(chunks) > 1:
+            logger.info(f"Адреса не влезают в одно сообщение — публикуем {len(chunks)} частями")
 
+        total = len(chunks)
         messages = []
         for i, chunk in enumerate(chunks, 1):
             label = f"  (часть {i}/{total})" if total > 1 else ""
@@ -345,8 +369,11 @@ class EnergyFormatter:
             cont = " (продолжение)" if i > 1 else ""
             parts += ["", f"<b>{addresses_title}{suffix}{cont}:</b>", "", _prepare_addresses(chunk)]
             if i == total:
-                # Сноска «список может быть неполным» — только на последней части
+                # Хвост последней части: сноска, а при переполнении — ещё и
+                # ссылка на первоисточник за полным списком адресов.
                 parts += ["", _ADDRESSES_NOTE]
+                if overflow and pointer:
+                    parts += ["", pointer]
             messages.append("\n".join(parts))
         return messages
 
