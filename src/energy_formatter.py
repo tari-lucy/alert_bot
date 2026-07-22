@@ -28,6 +28,18 @@ _AD_RE = re.compile(
     re.I | re.U
 )
 
+# Боилерплейт-приписки после адресов — общие слова без конкретики, повторяются
+# из поста в пост. Их убираем. Но СОДЕРЖАТЕЛЬНЫЕ хвостовые фразы («по возможности
+# включим часть потребителей Гагаринского района») сохраняем — это важно людям.
+_BOILERPLATE_RE = re.compile(
+    r'делают\s+всё\s+возможное'
+    r'|минимизировать\s+неудобств'
+    r'|наблюдаются\s+сбои'
+    r'|max\.ru'
+    r'|наш\w*\s+канал',
+    re.I | re.U
+)
+
 # Сноска самого Севастопольэнерго — срезаем из блока и ставим уже своей строкой
 _FOOTER_RE = re.compile(r'\n?\s*\*\s*Список\s+адресов.*$', re.S | re.I)
 
@@ -124,78 +136,78 @@ def _segments_by_queue(post_text: str) -> dict:
     return segments
 
 
-def _addresses_without_queue(post_text: str):
+def _raw_block(post_text: str, queue):
     """
-    Блок адресов для поста БЕЗ номера очереди (по району или по дефициту).
+    Сырой блок «адреса + возможный хвост» из поста или None.
 
-    Якорь — зачин списка («обесточены потребители:», «отсутствует по
-    адресам:»); берём всё после последнего такого зачина и оставляем только
-    похожие на адреса абзацы. Так отсекается хвост вроде «Ориентировочное
-    время восстановления электроснабжения — 15:00», который идёт следом.
+    queue=None — пост без очереди: якорь по зачину списка («…потребители:»,
+    «…по адресам:»), берём всё после последнего зачина. Иначе — по объявлению
+    очереди; None, если очередь объявлена несколько раз (привязка неоднозначна).
     """
-    body = _FOOTER_RE.sub('', post_text)
-    last = None
-    for last in _ADDR_LEADIN_RE.finditer(body):
-        pass
-    if last is None:
+    if queue is None:
+        body = _FOOTER_RE.sub('', post_text)
+        last = None
+        for last in _ADDR_LEADIN_RE.finditer(body):
+            pass
+        if last is None:
+            return None
+        return body[last.end():].strip() or None
+
+    blocks = _segments_by_queue(post_text).get(queue) or []
+    if len(blocks) != 1:
+        if len(blocks) > 1:
+            logger.warning(
+                f"Очередь {queue} объявлена в посте {len(blocks)} раза — "
+                "привязка адресов неоднозначна, публикуем без адресов"
+            )
         return None
-
-    tail = body[last.end():]
-    paragraphs = [p for p in _split_paragraphs(tail) if _ADDRESS_MARKER_RE.search(p)]
-    if not paragraphs:
-        return None
-    return "\n".join(paragraphs)
+    return blocks[0]
 
 
-def _strip_trailing_prose(block: str) -> str:
+def _partition_block(block: str):
     """
-    Отсекает хвостовые НЕадресные абзацы блока.
+    Делит блок на (адреса, хвост).
 
-    После адресов источник иногда дописывает общие фразы («Энергетики делают
-    всё возможное…», «По возможности включим…»). Они не адреса — убираем их с
-    конца, чтобы блок заканчивался на последнем адресе. Внутренние абзацы не
-    трогаем: срезаем только пока последний абзац не похож на адреса.
+    Адреса — абзацы до последнего похожего на адрес включительно (внутренние
+    неадресные абзацы остаются с адресами). Хвост — то, что после них: общие
+    фразы источника. Из хвоста выкидываем боилерплейт («делают всё возможное…»,
+    реклама MAX), но СОДЕРЖАТЕЛЬНЫЕ фразы («по возможности включим …район»)
+    сохраняем — это важно людям.
     """
     paragraphs = _split_paragraphs(block)
-    while paragraphs and not _ADDRESS_MARKER_RE.search(paragraphs[-1]):
-        paragraphs.pop()
-    return "\n\n".join(paragraphs)
+    marker_idx = [i for i, p in enumerate(paragraphs) if _ADDRESS_MARKER_RE.search(p)]
+    if not marker_idx:
+        return '', ''
+    cut = marker_idx[-1] + 1
+    addresses = "\n\n".join(paragraphs[:cut])
+    tail = "\n\n".join(p for p in paragraphs[cut:] if not _BOILERPLATE_RE.search(p))
+    return addresses, tail
 
 
 def extract_addresses(post_text: str, queue: int = None):
-    """
-    Дословный блок адресов или None.
-
-    queue=None — пост без очереди (по району/адресам), якорь по зачину списка.
-    Иначе якорь по объявлению очереди; None, если очередь объявлена несколько
-    раз (привязка адресов неоднозначна — публикуем без них, чтобы не приписать
-    людям чужие улицы).
-    """
+    """Дословный блок адресов или None (хвост-проза отсечена)."""
     if not post_text:
         return None
-
-    if queue is None:
-        block = _addresses_without_queue(post_text)
-    else:
-        blocks = _segments_by_queue(post_text).get(queue) or []
-        if len(blocks) != 1:
-            if len(blocks) > 1:
-                logger.warning(
-                    f"Очередь {queue} объявлена в посте {len(blocks)} раза — "
-                    "привязка адресов неоднозначна, публикуем без адресов"
-                )
-            return None
-        block = blocks[0]
-
+    block = _raw_block(post_text, queue)
     if not block:
         return None
-    # Хвостовая проза после адресов («Энергетики делают всё возможное…») — прочь.
-    block = _strip_trailing_prose(block)
-    if len(block) < 20 or not _ADDRESS_MARKER_RE.search(block):
+    addresses, _ = _partition_block(block)
+    if len(addresses) < 20 or not _ADDRESS_MARKER_RE.search(addresses):
         if queue is not None:
             logger.warning(f"Блок после объявления очереди {queue} не похож на адреса — публикуем без них")
         return None
-    return block
+    return addresses
+
+
+def extract_tail(post_text: str, queue: int = None) -> str:
+    """Содержательный хвост после адресов (без боилерплейта) или ''."""
+    if not post_text:
+        return ''
+    block = _raw_block(post_text, queue)
+    if not block:
+        return ''
+    _, tail = _partition_block(block)
+    return tail
 
 
 def _split_paragraphs(block: str) -> list:
@@ -242,6 +254,11 @@ def _prepare_addresses(block: str) -> str:
     return "\n\n".join(
         f"<i>{html.escape(p, quote=False)}</i>" for p in _split_paragraphs(block)
     )
+
+
+def _prepare_tail(tail: str) -> str:
+    """Содержательный хвост — обычным текстом (не курсивом, это не адреса)."""
+    return "\n\n".join(html.escape(p, quote=False) for p in _split_paragraphs(tail))
 
 
 def _boundary_len(text: str, n: int) -> int:
@@ -333,10 +350,12 @@ class EnergyFormatter:
         return line
 
     def _format_window(self, header: str, addresses_title: str, queue,
-                       time_from, time_to, restore=None, addresses: str = None) -> list:
+                       time_from, time_to, restore=None, addresses: str = None,
+                       tail: str = '') -> list:
         """Список готовых сообщений. Длинные адреса — несколькими частями."""
         time_line = self._time_line(time_from, time_to, restore)
         source = self._source_line()
+        tail_block = _prepare_tail(tail) if tail else ''
 
         if not addresses:
             parts = [header]
@@ -344,22 +363,25 @@ class EnergyFormatter:
                 parts += ["", time_line]
             if source:
                 parts += ["", source]
+            if tail_block:
+                parts += ["", tail_block]
             return ["\n".join(parts)]
 
         # Очередь в подзаголовке — только если она в посте реально названа
         suffix = f" ({queue} очередь)" if queue else ""
-        title = f"<b>{addresses_title}{suffix}:</b>"
 
         # Худший набор служебных строк для бюджета куска: шапка с САМОЙ ШИРОКОЙ
         # меткой части (двузначные/трёхзначные номера дают 1-2 лишних символа),
-        # время, источник, подзаголовок-продолжение, сноска. Любая реальная
-        # часть короче этого, значит гарантированно влезет в лимит.
+        # время, источник, подзаголовок-продолжение, сноска и хвост (всё это
+        # окажется на последней части). Любая реальная часть короче — влезет.
         worst_lines = [f"{header}  (часть 999/999)"]
         if time_line:
             worst_lines += ["", time_line]
         if source:
             worst_lines += ["", source]
         worst_lines += ["", f"<b>{addresses_title}{suffix} (продолжение):</b>"]
+        if tail_block:
+            worst_lines += ["", tail_block]
 
         pointer = self._source_pointer()
         chunks = _split_address_chunks(worst_lines, addresses)
@@ -389,8 +411,10 @@ class EnergyFormatter:
             cont = " (продолжение)" if i > 1 else ""
             parts += ["", f"<b>{addresses_title}{suffix}{cont}:</b>", "", _prepare_addresses(chunk)]
             if i == total:
-                # Хвост последней части: сноска, а при переполнении — ещё и
-                # ссылка на первоисточник за полным списком адресов.
+                # Хвост последней части: содержательная приписка источника (если
+                # была), затем сноска, а при переполнении — ссылка на первоисточник.
+                if tail_block:
+                    parts += ["", tail_block]
                 parts += ["", _ADDRESSES_NOTE]
                 if overflow and pointer:
                     parts += ["", pointer]
@@ -411,7 +435,8 @@ class EnergyFormatter:
         return f" — {queue} очередь"
 
     def format_outage(self, queue, time_from, time_to, confirmed: bool,
-                      restore=None, addresses: str = None, partial: bool = False) -> list:
+                      restore=None, addresses: str = None, partial: bool = False,
+                      tail: str = '') -> list:
         """Отключение в рамках ГВО. queue=None — отключение без номера очереди."""
         suffix = self._queue_suffix(queue, partial)
         if confirmed:
@@ -419,11 +444,11 @@ class EnergyFormatter:
         else:
             header = f"⚠️ <b>Ожидается отключение электроэнергии{suffix}</b>"
         return self._format_window(
-            header, "Адреса отключения", queue, time_from, time_to, restore, addresses
+            header, "Адреса отключения", queue, time_from, time_to, restore, addresses, tail
         )
 
     def format_supply(self, queue, time_from, time_to, restore=None,
-                      addresses: str = None, partial: bool = False) -> list:
+                      addresses: str = None, partial: bool = False, tail: str = '') -> list:
         """
         Пост «где свет БУДЕТ» — антипод отключения.
 
@@ -433,7 +458,7 @@ class EnergyFormatter:
         suffix = self._queue_suffix(queue, partial)
         header = f"💡 <b>Ориентировочно будет свет{suffix}</b>"
         return self._format_window(
-            header, "Адреса", queue, time_from, time_to, restore, addresses
+            header, "Адреса", queue, time_from, time_to, restore, addresses, tail
         )
 
     def _format_verbatim(self, header: str, post_text: str) -> str:
@@ -490,14 +515,18 @@ class EnergyFormatter:
                     f"Адреса не извлечены (очередь: {queue or 'не указана'}) — пост без адресов"
                 )
             partial = is_partial_queue(post_text, queue)
+            # Содержательная приписка источника после адресов («по возможности
+            # включим …район») — сохраняем; лежит в блоке того окна, за которым
+            # физически идёт, поэтому берём её per-window.
+            tail = extract_tail(post_text, queue)
             if msg_type == 'supply':
                 messages.extend(
                     self.format_supply(queue, w.get('from'), w.get('to'),
-                                       w.get('restore'), addresses, partial)
+                                       w.get('restore'), addresses, partial, tail)
                 )
             else:
                 messages.extend(
                     self.format_outage(queue, w.get('from'), w.get('to'), confirmed,
-                                       w.get('restore'), addresses, partial)
+                                       w.get('restore'), addresses, partial, tail)
                 )
         return messages
