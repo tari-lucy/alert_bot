@@ -65,7 +65,7 @@ class AlertBot:
         self.llm_extractor = None
         self.energy_formatter = None
         self._energy_skip_old = True
-        self._energy_recent = []  # Контент-дедуп дублей (одинаковый текст с разницей в секунды)
+        self._energy_recent = {}  # текст -> время публикации (антидубль в окне)
         self._energy_attempts = {}  # message_id -> число неудачных попыток извлечения
         if Config.ENERGY_ENABLED:
             logger.info(f"⚡ Энергоканал: читаем {Config.ENERGY_SOURCE_CHANNEL} → LLM → TG+MAX")
@@ -278,20 +278,44 @@ class AlertBot:
             return False
         return datetime.now() - last < timedelta(seconds=Config.ALERT_DEDUP_SECONDS)
 
-    async def _publish_energy(self, extraction: dict, message_id: int, post_text: str = '') -> int:
-        """Собирает и публикует посты из результата извлечения. Возвращает число опубликованных."""
+    def _is_duplicate_content(self, text: str) -> bool:
+        """
+        True, если ТОЧНО такой же текст публиковался меньше окна дедупа назад.
+
+        Окно короткое: ловим настоящие дубли (источник постит одно и то же
+        дважды за секунды), но НЕ глушим закономерно повторяющийся контент
+        (адреса/график повторяются от поста к посту — это нормальные новые
+        объявления).
+        """
+        last = self._energy_recent.get(text)
+        if last is None:
+            return False
+        return datetime.now() - last < timedelta(seconds=Config.ENERGY_DEDUP_SECONDS)
+
+    async def _publish_energy(self, extraction: dict, message_id: int, post_text: str = ''):
+        """
+        Собирает и публикует посты из результата извлечения.
+
+        Возвращает (published, failed): сколько сообщений реально опубликовано и
+        сколько НЕ удалось из-за ошибки. Пропуск дубля — это не ошибка.
+        """
         published = 0
+        failed = 0
+        # Подчистим протухшие записи окна, чтобы словарь не рос бесконечно.
+        cutoff = datetime.now() - timedelta(seconds=Config.ENERGY_DEDUP_SECONDS)
+        self._energy_recent = {t: ts for t, ts in self._energy_recent.items() if ts >= cutoff}
+
         for text in self.energy_formatter.build_messages(extraction, post_text):
-            if text in self._energy_recent:
-                logger.info(f"Энергопост {message_id}: дубль контента, пропуск")
+            if self._is_duplicate_content(text):
+                logger.info(f"Энергопост {message_id}: дубль контента в окне {Config.ENERGY_DEDUP_SECONDS}с, пропуск")
                 continue
             success = await self.publish_to_all(text, source_message_id=message_id)
             if success:
-                self._energy_recent.append(text)
-                if len(self._energy_recent) > 30:
-                    self._energy_recent.pop(0)
+                self._energy_recent[text] = datetime.now()
                 published += 1
-        return published
+            else:
+                failed += 1
+        return published, failed
 
     async def process_energy_posts(self):
         channel = Config.ENERGY_SOURCE_CHANNEL
@@ -398,12 +422,17 @@ class AlertBot:
                 await self.storage.mark_processed(message.id, channel)
                 continue
 
-            published = await self._publish_energy(extraction, message.id, post_text)
-            if published > 0:
+            published, failed = await self._publish_energy(extraction, message.id, post_text)
+            if failed > 0:
+                # Реальная ошибка публикации (сеть/API) — НЕ помечаем, повторим позже.
+                logger.error(f"Энергопост {message.id}: ошибка публикации ({failed}) — повторим позже (тип {extraction['type']})")
+            elif published > 0:
                 await self.storage.mark_processed(message.id, channel)
                 logger.info(f"Энергопост {message.id}: опубликовано сообщений: {published} (тип {extraction['type']})")
             else:
-                logger.error(f"Энергопост {message.id}: не удалось опубликовать (тип {extraction['type']})")
+                # Всё содержимое — дубль в окне; это не ошибка, пост уже отработан.
+                await self.storage.mark_processed(message.id, channel)
+                logger.info(f"Энергопост {message.id}: контент уже публиковался в окне — пропуск (тип {extraction['type']})")
 
     async def _energy_loop(self):
         """
