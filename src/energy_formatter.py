@@ -355,19 +355,25 @@ class EnergyFormatter:
 
     def _format_window(self, header: str, addresses_title: str, queue,
                        time_from, time_to, restore=None, addresses: str = None,
-                       tail: str = '') -> list:
+                       tail: str = '', body: str = '') -> list:
         """Список готовых сообщений. Длинные адреса — несколькими частями."""
         time_line = self._time_line(time_from, time_to, restore)
         source = self._source_line()
         tail_block = _prepare_tail(tail) if tail else ''
 
         if not addresses:
+            # Списка адресов нет. Если локация описана прозой («в районах
+            # Камышовой бухты и Байдарской долины») — показываем дословный текст
+            # поста, чтобы не потерять её. Иначе — только шапка/время/источник.
             parts = [header]
             if time_line:
                 parts += ["", time_line]
             if source:
                 parts += ["", source]
-            if tail_block:
+            body_block = _clean_body(body) if body else ''
+            if body_block:
+                parts += ["", body_block]
+            elif tail_block:
                 parts += ["", tail_block]
             return ["\n".join(parts)]
 
@@ -440,7 +446,7 @@ class EnergyFormatter:
 
     def format_outage(self, queue, time_from, time_to, confirmed: bool,
                       restore=None, addresses: str = None, partial: bool = False,
-                      tail: str = '') -> list:
+                      tail: str = '', body: str = '') -> list:
         """Отключение в рамках ГВО. queue=None — отключение без номера очереди."""
         suffix = self._queue_suffix(queue, partial)
         if confirmed:
@@ -448,11 +454,12 @@ class EnergyFormatter:
         else:
             header = f"⚠️ <b>Ожидается отключение электроэнергии{suffix}</b>"
         return self._format_window(
-            header, "Адреса отключения", queue, time_from, time_to, restore, addresses, tail
+            header, "Адреса отключения", queue, time_from, time_to, restore, addresses, tail, body
         )
 
     def format_supply(self, queue, time_from, time_to, restore=None,
-                      addresses: str = None, partial: bool = False, tail: str = '') -> list:
+                      addresses: str = None, partial: bool = False, tail: str = '',
+                      body: str = '') -> list:
         """
         Пост «где свет БУДЕТ» — антипод отключения.
 
@@ -462,7 +469,7 @@ class EnergyFormatter:
         suffix = self._queue_suffix(queue, partial)
         header = f"💡 <b>Ориентировочно будет свет{suffix}</b>"
         return self._format_window(
-            header, "Адреса", queue, time_from, time_to, restore, addresses, tail
+            header, "Адреса", queue, time_from, time_to, restore, addresses, tail, body
         )
 
     def _format_verbatim(self, header: str, post_text: str) -> str:
@@ -523,14 +530,18 @@ class EnergyFormatter:
             # включим …район») — сохраняем; лежит в блоке того окна, за которым
             # физически идёт, поэтому берём её per-window.
             tail = extract_tail(post_text, queue)
+            # Если списка адресов нет, локация может быть прозой в теле поста —
+            # передаём текст, чтобы фолбэк показал её дословно (per-window body
+            # только когда окно одно, иначе тело относится ко всему посту).
+            body = post_text if not addresses and len(extraction.get('windows', [])) == 1 else ''
             if msg_type == 'supply':
                 messages.extend(
                     self.format_supply(queue, w.get('from'), w.get('to'),
-                                       w.get('restore'), addresses, partial, tail)
+                                       w.get('restore'), addresses, partial, tail, body)
                 )
             else:
                 messages.extend(
                     self.format_outage(queue, w.get('from'), w.get('to'), confirmed,
-                                       w.get('restore'), addresses, partial, tail)
+                                       w.get('restore'), addresses, partial, tail, body)
                 )
         return messages
