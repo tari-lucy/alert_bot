@@ -98,6 +98,92 @@ def is_partial_queue(post_text: str, queue) -> bool:
     )
 
 
+# «ПО ВОЗМОЖНОСТИ энергетики БУДУТ СТАРАТЬСЯ восстановить электроснабжение
+# у части потребителей N очереди» — источник не обещает свет, а сообщает, что
+# в этом промежутке будет ПЫТАТЬСЯ его дать. Разница смысловая и важная:
+# интервал здесь означает не «когда свет есть», а «когда идут попытки».
+# Обычный supply («электроснабжение ориентировочно БУДЕТ с 12:00 до 14:00»)
+# звучит заметно твёрже, и подавать эти посты одинаково нельзя.
+_BEST_EFFORT_RE = re.compile(
+    r'по\s+возможности|буд\w*\s+стараться|постара\w+', re.I | re.U
+)
+
+# Принятый режим чередования внутри обычного поста («…будем придерживаться
+# режима «2 через 6»»). Якорь — глагол ПРИНЯТИЯ: в одном посте соседствуют
+# отвергнутый и принятый графики («соблюдать «3 через 3» невозможно… будем
+# придерживаться «2 через 6»»), и взять не тот — снова исказить смысл.
+# Глагол «соблюдать/сохранить» намеренно НЕ в списке: с ним пишут про тот
+# график, который как раз НЕ выходит выдержать.
+_SCHEDULE_ADOPT_RE = re.compile(
+    r'(?:придержива\w+|переход\w+|перевед\w+|переводим|вводит\w+|введ\w+|'
+    r'устанавлива\w+|действует|будет\s+действовать)'
+    r'[^.!?\n]{0,80}?«?\s*(\d+)\s*через\s*(\d+)', re.I | re.U
+)
+
+
+def extract_announcement(post_text: str, queue) -> str:
+    """
+    Дословная фраза-объявление окна из поста («По возможности с 16:00 до 18:00
+    энергетики будут стараться восстановить электроснабжение у части
+    потребителей 1 очереди») или ''.
+
+    Берём строку с объявлением очереди и отрезаем зачин списка адресов —
+    получается ровно предложение источника, без нашего пересказа. Если очередь
+    объявлена не один раз, привязка неоднозначна и фразу не возвращаем.
+    """
+    if not post_text or queue is None:
+        return ''
+    body = _FOOTER_RE.sub('', post_text)
+    matches = [m for m in _QUEUE_DECL_RE.finditer(body) if m.group(1) == str(queue)]
+    if len(matches) != 1:
+        return ''
+
+    m = matches[0]
+    start = body.rfind('\n', 0, m.start()) + 1
+    end = body.find('\n', m.end())
+    end = len(body) if end < 0 else end
+    line = body[start:end]
+
+    lead = _ADDR_LEADIN_RE.search(line, m.end() - start)
+    if lead:
+        line = line[:lead.start()]
+    # Ведущие эмодзи и восклицательные знаки источника («❗️  По возможности…»)
+    line = re.sub(r'^[^\w«"(]+', '', line.strip())
+    return line.strip(' \t:,;—–-')
+
+
+def is_best_effort(post_text: str, queue) -> bool:
+    """
+    Обещает ли источник свет — или только попытку его дать.
+
+    Смотрим прежде всего в само объявление окна; если выделить его не удалось,
+    смотрим по всему посту. Ошибка в сторону «постараются» безопасна: она
+    обещает меньше, чем сказал источник, а не больше.
+    """
+    if not post_text:
+        return False
+    announcement = extract_announcement(post_text, queue)
+    return bool(_BEST_EFFORT_RE.search(announcement or post_text))
+
+
+def extract_adopted_schedule(post_text: str) -> str:
+    """
+    Режим чередования, который источник объявил ПРИНЯТЫМ («2 через 6»), или ''.
+
+    Берётся из текста детерминированно, а не у модели: в посте про окно
+    восстановления смена графика — отдельная новость для всего города, и
+    потерять её нельзя, но и перепутать принятый график с отвергнутым тоже.
+    Нет однозначного глагола принятия — строки просто не будет.
+    """
+    if not post_text:
+        return ''
+    matches = list(_SCHEDULE_ADOPT_RE.finditer(_FOOTER_RE.sub('', post_text)))
+    if not matches:
+        return ''
+    last = matches[-1]
+    return f"{last.group(1)} через {last.group(2)}"
+
+
 def _segments_by_queue(post_text: str) -> dict:
     """
     Режет пост на блоки адресов по объявлениям очереди.
@@ -330,15 +416,28 @@ class EnergyFormatter:
             return f'<i>Полный список адресов — в канале «{self.source_name}».</i>'
         return '<i>Полный список адресов — в первоисточнике.</i>'
 
-    def _time_line(self, time_from, time_to, restore=None):
+    def _time_line(self, time_from, time_to, restore=None, best_effort: bool = False):
         """
         Строка времени из того, что реально написано в посте.
 
         Ничего не додумываем: нет времени вовсе — строки не будет.
         «restore» — это «ориентировочное время восстановления», оно не равно
         концу интервала, поэтому и формулировка другая.
+
+        best_effort — источник обещает не свет, а попытки его дать; тогда
+        интервал это период попыток, и голые часы читались бы как гарантия
+        («включат в 16:00, выключат в 18:00»), чего источник не говорил.
         """
-        if time_from and time_to:
+        if best_effort:
+            if time_from and time_to:
+                line = f"🕐 Постараются в период {time_from}–{time_to}"
+            elif time_to:
+                line = f"🕐 Постараются до {time_to}"
+            elif time_from:
+                line = f"🕐 Постараются с {time_from}"
+            else:
+                line = None
+        elif time_from and time_to:
             line = f"🕐 {time_from}–{time_to}"
         elif time_to:
             line = f"🕐 До {time_to}"
@@ -355,9 +454,29 @@ class EnergyFormatter:
 
     def _format_window(self, header: str, addresses_title: str, queue,
                        time_from, time_to, restore=None, addresses: str = None,
-                       tail: str = '', body: str = '') -> list:
+                       tail: str = '', body: str = '', announcement: str = '',
+                       schedule: str = '', best_effort: bool = False) -> list:
         """Список готовых сообщений. Длинные адреса — несколькими частями."""
-        time_line = self._time_line(time_from, time_to, restore)
+        # Дословная фраза источника вместо нашей строки времени: когда энергетики
+        # лишь «стараются» дать свет, интервал сам по себе обещал бы больше.
+        if announcement:
+            time_line = html.escape(announcement, quote=False).rstrip('.') + '.'
+        else:
+            time_line = self._time_line(time_from, time_to, restore, best_effort)
+
+        # Смена режима чередования, объявленная в этом же посте, — новость для
+        # всего города, а не только для очереди из окна; без неё пост неполон.
+        schedule_line = (
+            f"⚡ <b>График изменён: «{html.escape(schedule, quote=False)}»</b>"
+            if schedule else ''
+        )
+
+        intro = []
+        if schedule_line:
+            intro += ["", schedule_line]
+        if time_line:
+            intro += ["", time_line]
+
         source = self._source_line()
         tail_block = _prepare_tail(tail) if tail else ''
 
@@ -365,9 +484,7 @@ class EnergyFormatter:
             # Списка адресов нет. Если локация описана прозой («в районах
             # Камышовой бухты и Байдарской долины») — показываем дословный текст
             # поста, чтобы не потерять её. Иначе — только шапка/время/источник.
-            parts = [header]
-            if time_line:
-                parts += ["", time_line]
+            parts = [header] + intro
             if source:
                 parts += ["", source]
             body_block = _clean_body(body) if body else ''
@@ -384,9 +501,7 @@ class EnergyFormatter:
         # меткой части (двузначные/трёхзначные номера дают 1-2 лишних символа),
         # время, источник, подзаголовок-продолжение, сноска и хвост (всё это
         # окажется на последней части). Любая реальная часть короче — влезет.
-        worst_lines = [f"{header}  (часть 999/999)"]
-        if time_line:
-            worst_lines += ["", time_line]
+        worst_lines = [f"{header}  (часть 999/999)"] + intro
         if source:
             worst_lines += ["", source]
         worst_lines += ["", f"<b>{addresses_title}{suffix} (продолжение):</b>"]
@@ -413,9 +528,8 @@ class EnergyFormatter:
             label = f"  (часть {i}/{total})" if total > 1 else ""
             parts = [f"{header}{label}"]
             if i == 1:
-                # Время и источник — только на первой части
-                if time_line:
-                    parts += ["", time_line]
+                # График, время и источник — только на первой части
+                parts += intro
                 if source:
                     parts += ["", source]
             cont = " (продолжение)" if i > 1 else ""
@@ -446,7 +560,7 @@ class EnergyFormatter:
 
     def format_outage(self, queue, time_from, time_to, confirmed: bool,
                       restore=None, addresses: str = None, partial: bool = False,
-                      tail: str = '', body: str = '') -> list:
+                      tail: str = '', body: str = '', schedule: str = '') -> list:
         """Отключение в рамках ГВО. queue=None — отключение без номера очереди."""
         suffix = self._queue_suffix(queue, partial)
         if confirmed:
@@ -454,22 +568,30 @@ class EnergyFormatter:
         else:
             header = f"⚠️ <b>Ожидается отключение электроэнергии{suffix}</b>"
         return self._format_window(
-            header, "Адреса отключения", queue, time_from, time_to, restore, addresses, tail, body
+            header, "Адреса отключения", queue, time_from, time_to, restore, addresses,
+            tail, body, schedule=schedule
         )
 
     def format_supply(self, queue, time_from, time_to, restore=None,
                       addresses: str = None, partial: bool = False, tail: str = '',
-                      body: str = '') -> list:
+                      body: str = '', announcement: str = '', schedule: str = '',
+                      best_effort: bool = False) -> list:
         """
         Пост «где свет БУДЕТ» — антипод отключения.
 
-        Источник пишет «ориентировочно будет», гарантии он не даёт, поэтому
-        и заголовок не обещает твёрдо.
+        Источник гарантий не даёт, поэтому и заголовок не обещает твёрдо. Двух
+        степеней уверенности: «ориентировочно будет» — свет ожидается в окне;
+        «по возможности будут стараться восстановить» — обещаны только попытки,
+        и тогда вместо нашей строки времени печатается фраза самого источника.
         """
         suffix = self._queue_suffix(queue, partial)
-        header = f"💡 <b>Ориентировочно будет свет{suffix}</b>"
+        if best_effort:
+            header = f"💡 <b>Постараются включить свет{suffix}</b>"
+        else:
+            header = f"💡 <b>Ориентировочно будет свет{suffix}</b>"
         return self._format_window(
-            header, "Адреса", queue, time_from, time_to, restore, addresses, tail, body
+            header, "Адреса", queue, time_from, time_to, restore, addresses, tail, body,
+            announcement=announcement, schedule=schedule, best_effort=best_effort
         )
 
     def _format_verbatim(self, header: str, post_text: str) -> str:
@@ -517,6 +639,17 @@ class EnergyFormatter:
             return []
 
         confirmed = extraction.get('confirmed', False)
+        # Смена режима, объявленная внутри этого же поста («…будем придерживаться
+        # режима «2 через 6»»). Берём из текста, а не у модели: принятый график
+        # соседствует в посте с отвергнутым, и перепутать их нельзя.
+        schedule = extract_adopted_schedule(post_text)
+        claimed = extraction.get('schedule')
+        if claimed and claimed != schedule:
+            # Расхождение — повод посмотреть глазами: публикуем версию из текста.
+            logger.warning(
+                f"Модель назвала график «{claimed}», из текста извлечён "
+                f"«{schedule or 'ничего'}» — публикуем версию из текста"
+            )
         messages = []
         for w in extraction.get('windows', []):
             queue = w.get('queue')
@@ -535,13 +668,20 @@ class EnergyFormatter:
             # только когда окно одно, иначе тело относится ко всему посту).
             body = post_text if not addresses and len(extraction.get('windows', [])) == 1 else ''
             if msg_type == 'supply':
+                # «Постараются» против «ориентировочно будет»: если источник
+                # обещает лишь попытки, публикуем его фразу дословно, а не наш
+                # интервал — интервал прочтётся как гарантия включения.
+                best_effort = is_best_effort(post_text, queue)
+                announcement = extract_announcement(post_text, queue) if best_effort else ''
                 messages.extend(
                     self.format_supply(queue, w.get('from'), w.get('to'),
-                                       w.get('restore'), addresses, partial, tail, body)
+                                       w.get('restore'), addresses, partial, tail, body,
+                                       announcement, schedule, best_effort)
                 )
             else:
                 messages.extend(
                     self.format_outage(queue, w.get('from'), w.get('to'), confirmed,
-                                       w.get('restore'), addresses, partial, tail, body)
+                                       w.get('restore'), addresses, partial, tail, body,
+                                       schedule)
                 )
         return messages
