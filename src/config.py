@@ -25,6 +25,14 @@ class Config:
     KEYWORDS_CLEAR_FILE = os.getenv('KEYWORDS_CLEAR_FILE', 'data/keywords_clear.txt')
     CLEAR_TEMPLATE = os.getenv('CLEAR_TEMPLATE', '')
 
+    # Сигнал «Морская опасность» и его отбой. Источник даёт этот сигнал при
+    # атаке морскими дронами; он не отменяет и не заменяет воздушную тревогу —
+    # оба сигнала могут действовать одновременно.
+    KEYWORDS_SEA_ALERT_FILE = os.getenv('KEYWORDS_SEA_ALERT_FILE', 'data/keywords_sea_alert.txt')
+    KEYWORDS_SEA_CLEAR_FILE = os.getenv('KEYWORDS_SEA_CLEAR_FILE', 'data/keywords_sea_clear.txt')
+    SEA_ALERT_TEMPLATE = os.getenv('SEA_ALERT_TEMPLATE', '')
+    SEA_CLEAR_TEMPLATE = os.getenv('SEA_CLEAR_TEMPLATE', '')
+
     # Обратная совместимость (старый KEYWORDS_FILE)
     KEYWORDS_FILE = os.getenv('KEYWORDS_FILE', KEYWORDS_ALERT_FILE)
 
@@ -41,6 +49,14 @@ class Config:
     # его глушить нельзя.
     ENERGY_DEDUP_SECONDS = int(os.getenv('ENERGY_DEDUP_SECONDS', '300'))
 
+    # Окно, в котором повторный ТОТ ЖЕ сигнал считается дублем. В отличие от
+    # ALERT_DEDUP_SECONDS привязано не к шаблону, а к состоянию сигнала, и
+    # сбрасывается противоположным сигналом (отбой обнуляет тревогу и наоборот).
+    # Окно широкое, потому что один сигнал приходит из двух источников с
+    # разбегом в минуты: в ВК он появляется раньше, чем в телеграме. Но оно
+    # НЕ бесконечное — иначе пропущенный отбой заглушил бы следующую тревогу.
+    SIGNAL_DEDUP_SECONDS = int(os.getenv('SIGNAL_DEDUP_SECONDS', '1800'))
+
     # Гибридный режим: использовать Bot API для публикации (опционально)
     BOT_TOKEN = os.getenv('BOT_TOKEN', '')  # Если указан - публикация через Bot API
     USE_BOT_FOR_PUBLISHING = bool(BOT_TOKEN)
@@ -49,6 +65,24 @@ class Config:
     MAX_BOT_TOKEN = os.getenv('MAX_BOT_TOKEN', '')
     MAX_TARGET_CHANNEL = os.getenv('MAX_TARGET_CHANNEL', '')
     MAX_ENABLED = bool(MAX_BOT_TOKEN and MAX_TARGET_CHANNEL)
+
+    # ВКонтакте — второй источник сигналов оповещения. Появился потому, что в
+    # телеграм автор публикует нестабильно и с опозданием, а часть сигналов
+    # вообще выкладывает картинкой без подписи.
+    VK_SERVICE_TOKEN = os.getenv('VK_SERVICE_TOKEN', '')
+    VK_DOMAIN = os.getenv('VK_DOMAIN', '')  # короткое имя страницы, напр. razvozhaev_m
+    VK_API_VERSION = os.getenv('VK_API_VERSION', '5.199')
+    VK_ENABLED = bool(VK_SERVICE_TOKEN and VK_DOMAIN)
+    # Интервал опроса ВК. Такой же, как у телеграма: лимиты API позволяют
+    # намного чаще, но привлекать внимание к токену незачем.
+    VK_CHECK_INTERVAL = int(os.getenv('VK_CHECK_INTERVAL', CHECK_INTERVAL))
+
+    # Распознавание картинок-плашек, которыми публикуются сигналы.
+    PLATES_DIR = os.getenv('PLATES_DIR', 'data/plates')
+    # Модель для чтения НЕЗНАКОМОЙ картинки. Знакомые плашки узнаются по
+    # перцептивному хешу бесплатно и мгновенно, модель включается редко —
+    # только когда источник нарисует новую плашку.
+    VISION_MODEL = os.getenv('VISION_MODEL', 'openai/gpt-4.1-nano')
 
     # Второй источник — канал энергетиков (Севастопольэнерго): отключения по очередям.
     # Посты преобразуются через LLM и публикуются в те же цели (TG + MAX).
@@ -84,7 +118,52 @@ class Config:
 
     SESSION_NAME = 'alert_bot_session'
     DATA_FILE = 'data/processed_posts.json'
+    # Действующее состояние сигналов (тревога/отбой по группам). Переживает
+    # перезапуск, иначе рестарт между приходом сигнала из ВК и из телеграма
+    # давал бы дубль.
+    SIGNAL_STATE_FILE = 'data/signal_state.json'
     LOG_FILE = 'logs/bot.log'
+
+    @classmethod
+    def signals(cls) -> dict:
+        """
+        Таблица видов сигналов: имя → файл фраз, шаблон публикации, группа.
+
+        «Группа» — это то, что сигнал включает и выключает: у воздушной тревоги
+        и её отбоя группа общая («air»), поэтому отбой гасит тревогу. Морская
+        опасность живёт в своей группе и на воздушную тревогу не влияет —
+        сигналы могут действовать одновременно.
+
+        Новый вид сигнала = файл фраз + шаблон в .env + строка здесь.
+        Сигнал без заполненного шаблона просто не подключается: так его можно
+        держать выключенным, не удаляя фразы.
+        """
+        table = {
+            'alert': {
+                'group': 'air', 'kind': 'alert',
+                'keywords_file': cls.KEYWORDS_ALERT_FILE, 'template': cls.ALERT_TEMPLATE,
+                'title': 'Воздушная тревога',
+            },
+            'clear': {
+                'group': 'air', 'kind': 'clear',
+                'keywords_file': cls.KEYWORDS_CLEAR_FILE, 'template': cls.CLEAR_TEMPLATE,
+                'title': 'Отбой воздушной тревоги',
+            },
+            'sea_alert': {
+                'group': 'sea', 'kind': 'alert',
+                'keywords_file': cls.KEYWORDS_SEA_ALERT_FILE, 'template': cls.SEA_ALERT_TEMPLATE,
+                'title': 'Морская опасность',
+            },
+            'sea_clear': {
+                'group': 'sea', 'kind': 'clear',
+                'keywords_file': cls.KEYWORDS_SEA_CLEAR_FILE, 'template': cls.SEA_CLEAR_TEMPLATE,
+                'title': 'Отбой морской опасности',
+            },
+        }
+        return {
+            name: spec for name, spec in table.items()
+            if spec['template'].strip() and os.path.exists(spec['keywords_file'])
+        }
 
     @classmethod
     def validate(cls):
@@ -118,5 +197,18 @@ class Config:
         # Проверка второго источника: если канал задан, нужен ключ LLM
         if cls.ENERGY_SOURCE_CHANNEL and not cls.LLM_API_KEY:
             raise ValueError("LLM_API_KEY должен быть указан, если задан ENERGY_SOURCE_CHANNEL")
+
+        # Проверка источника ВК: токен без страницы (и наоборот) бесполезен
+        if cls.VK_SERVICE_TOKEN and not cls.VK_DOMAIN:
+            raise ValueError("VK_DOMAIN должен быть указан, если задан VK_SERVICE_TOKEN")
+        if cls.VK_DOMAIN and not cls.VK_SERVICE_TOKEN:
+            raise ValueError("VK_SERVICE_TOKEN должен быть указан, если задан VK_DOMAIN")
+
+        # Сигнал без шаблона молча не публикуется — предупреждаем явно, чтобы
+        # заполненные фразы не создавали ложного ощущения работающего сигнала.
+        for name, spec in (('sea_alert', cls.SEA_ALERT_TEMPLATE),
+                           ('sea_clear', cls.SEA_CLEAR_TEMPLATE)):
+            if not spec.strip():
+                print(f"ВНИМАНИЕ: шаблон сигнала «{name}» пуст — сигнал публиковаться не будет")
 
         return True

@@ -1,6 +1,6 @@
 import re
-from typing import Set
-from telethon.tl.types import Message
+from typing import Dict, Optional, Set
+
 from .logger import setup_logger
 
 logger = setup_logger('filter')
@@ -8,101 +8,72 @@ logger = setup_logger('filter')
 
 class TextFilter:
     """
-    Фильтр для проверки текста сообщений на соответствие ключевым фразам.
-    Поддерживает точное совпадение с игнорированием эмодзи и регистра.
-    Различает типы сообщений: тревога (alert) и отбой (clear).
+    Определяет, каким сигналом оповещения является текст.
+
+    Сигналов теперь несколько видов (воздушная тревога и её отбой, морская
+    опасность и её отбой), и список будет расти: город вводит новые сигналы,
+    а мы узнаём о них постфактум. Поэтому виды заданы данными — таблицей
+    «имя сигнала → файл ключевых фраз», — и новый сигнал добавляется файлом
+    фраз плюс шаблоном в .env, без единой правки кода.
+
+    Сравнение: фраза должна стоять В НАЧАЛЕ текста; эмодзи, регистр и «!»
+    игнорируются. Через этот же фильтр проходит текст, распознанный с
+    картинки-плашки, поэтому файлы фраз остаются единственным местом, где
+    записано, что вообще считается сигналом.
     """
 
-    def __init__(self, alert_keywords_file: str, clear_keywords_file: str):
+    def __init__(self, signal_files: Dict[str, str]):
         """
         Args:
-            alert_keywords_file: Путь к файлу с фразами тревоги
-            clear_keywords_file: Путь к файлу с фразами отбоя
+            signal_files: {имя сигнала: путь к файлу ключевых фраз}.
+                Порядок важен: совпадения проверяются в порядке объявления.
         """
-        self.alert_keywords_file = alert_keywords_file
-        self.clear_keywords_file = clear_keywords_file
-        self.alert_keywords: Set[str] = set()
-        self.clear_keywords: Set[str] = set()
+        self.signal_files = dict(signal_files)
+        self.keywords: Dict[str, Set[str]] = {name: set() for name in signal_files}
 
-    def load_keywords(self) -> tuple:
+    def load_keywords(self) -> Dict[str, int]:
         """
-        Загружает ключевые фразы из обоих файлов.
+        Загружает фразы всех сигналов. Возвращает {имя сигнала: сколько фраз}.
 
-        Returns:
-            Кортеж (количество_фраз_тревоги, количество_фраз_отбоя)
+        Отсутствие файла — ошибка: молча остаться без половины сигналов
+        опаснее, чем не запуститься.
         """
-        alert_count = self._load_keywords_from_file(
-            self.alert_keywords_file,
-            self.alert_keywords,
-            "тревоги"
-        )
-        clear_count = self._load_keywords_from_file(
-            self.clear_keywords_file,
-            self.clear_keywords,
-            "отбоя"
-        )
-
+        counts = {}
+        for name, path in self.signal_files.items():
+            counts[name] = self._load_file(name, path)
+        total = sum(counts.values())
         logger.info(
-            f"Загружено {alert_count} фраз тревоги и {clear_count} фраз отбоя"
+            "Загружено фраз: " + ", ".join(f"{n} — {c}" for n, c in counts.items())
+            + f" (всего {total})"
         )
-        return (alert_count, clear_count)
+        return counts
 
-    def _load_keywords_from_file(
-        self,
-        file_path: str,
-        keywords_set: Set[str],
-        category: str
-    ) -> int:
-        """
-        Загружает ключевые фразы из одного файла.
-
-        Args:
-            file_path: Путь к файлу
-            keywords_set: Множество для сохранения фраз
-            category: Название категории (для логов)
-
-        Returns:
-            Количество загруженных фраз
-        """
+    def _load_file(self, name: str, file_path: str) -> int:
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
-
-            keywords_set.clear()
-
-            for line in lines:
-                keyword = line.strip()
-
-                # Пропускаем пустые строки и комментарии
-                if not keyword or keyword.startswith('#'):
-                    continue
-
-                # Нормализуем ключевую фразу при загрузке
-                normalized = self._normalize_text(keyword)
-                if normalized:
-                    keywords_set.add(normalized)
-
-            logger.info(f"Загружено {len(keywords_set)} фраз {category} из {file_path}")
-            return len(keywords_set)
-
         except FileNotFoundError:
-            logger.error(f"Файл фраз {category} не найден: {file_path}")
+            logger.error(f"Файл фраз сигнала «{name}» не найден: {file_path}")
             raise
         except Exception as e:
-            logger.error(f"Ошибка при загрузке фраз {category}: {e}")
+            logger.error(f"Ошибка при загрузке фраз сигнала «{name}»: {e}")
             raise
 
+        phrases = self.keywords.setdefault(name, set())
+        phrases.clear()
+        for line in lines:
+            keyword = line.strip()
+            if not keyword or keyword.startswith('#'):
+                continue
+            normalized = self._normalize_text(keyword)
+            if normalized:
+                phrases.add(normalized)
+
+        logger.info(f"Сигнал «{name}»: {len(phrases)} фраз из {file_path}")
+        return len(phrases)
+
     def _remove_emojis(self, text: str) -> str:
-        """
-        Удаляет все эмодзи из текста.
-
-        Args:
-            text: Исходный текст
-
-        Returns:
-            Текст без эмодзи
-        """
-        # Регулярное выражение для удаления эмодзи
+        """Удаляет эмодзи (в том числе селекторы вариаций вроде ❗️)."""
         emoji_pattern = re.compile(
             "["
             "\U0001F600-\U0001F64F"  # эмодзи лиц
@@ -123,88 +94,60 @@ class TextFilter:
 
     def _normalize_text(self, text: str) -> str:
         """
-        Нормализует текст для сравнения:
-        - Удаляет эмодзи
-        - Удаляет восклицательные знаки
-        - Приводит к нижнему регистру
-        - Нормализует пробелы
+        Приводит текст к виду для сравнения: без эмодзи и «!», нижний регистр,
+        одиночные пробелы.
 
-        Args:
-            text: Исходный текст
-
-        Returns:
-            Нормализованный текст
+        Восклицательный знак заменяется ПРОБЕЛОМ, а не пустотой: источник
+        иногда пишет «ВНИМАНИЕ ВСЕМ!Воздушная тревога» без пробела после знака,
+        и при простом удалении слова склеивались в «всемвоздушная», из-за чего
+        сигнал не опознавался.
         """
         if not text:
             return ""
 
-        # Удаляем эмодзи
         text = self._remove_emojis(text)
-
-        # Удаляем восклицательные знаки
-        text = text.replace('!', '')
-
-        # Нормализация пробелов
-        # Заменяем все виды пробельных символов на обычный пробел
+        text = text.replace('!', ' ')
         text = re.sub(r'\s+', ' ', text)
+        return text.strip().lower()
 
-        # Убираем пробелы в начале и конце
-        text = text.strip()
-
-        # Приведение к нижнему регистру
-        text = text.lower()
-
-        return text
-
-    def get_message_type(self, text: str) -> str:
-        """
-        Определяет тип сообщения по тексту.
-
-        Args:
-            text: Текст для проверки
-
-        Returns:
-            'alert' - тревога, 'clear' - отбой, None - не совпало
-        """
+    def get_message_type(self, text: str) -> Optional[str]:
+        """Имя сигнала, которым является текст, или None."""
         if not text:
             return None
 
         normalized_text = self._normalize_text(text)
 
-        # Проверяем тревогу (фраза в начале текста)
-        for keyword in self.alert_keywords:
-            if normalized_text.startswith(keyword):
-                logger.info(f"Найдена ТРЕВОГА. Текст: '{text[:100]}...'")
-                return 'alert'
-
-        # Проверяем отбой (фраза в начале текста)
-        for keyword in self.clear_keywords:
-            if normalized_text.startswith(keyword):
-                logger.info(f"Найден ОТБОЙ. Текст: '{text[:100]}...'")
-                return 'clear'
+        for name in self.signal_files:
+            for keyword in self.keywords.get(name, ()):
+                if normalized_text.startswith(keyword):
+                    logger.info(f"Опознан сигнал «{name}». Текст: '{text[:100]}'")
+                    return name
 
         return None
 
-    def check_message(self, message: Message) -> str:
-        """
-        Проверяет сообщение Telegram и определяет его тип.
-
-        Args:
-            message: Объект сообщения Telethon
-
-        Returns:
-            'alert' - тревога, 'clear' - отбой, None - не совпало
-        """
+    def check_message(self, message) -> Optional[str]:
+        """Имя сигнала для сообщения телеграма или None."""
         if not message or not message.text:
             return None
-
         return self.get_message_type(message.text)
 
-    def get_keywords_count(self) -> tuple:
+    def looks_like_signal(self, text: str) -> bool:
         """
-        Возвращает количество загруженных ключевых фраз.
+        Похож ли текст на сигнал оповещения, даже если ни с чем не совпал.
 
-        Returns:
-            Кортеж (количество_тревог, количество_отбоев)
+        Нужен для страховки от тихого промаха: источник меняет формулировки, и
+        раньше такой пост просто исчезал в логах. Теперь о подозрительном, но
+        не опознанном тексте узнаёт администратор.
         """
-        return (len(self.alert_keywords), len(self.clear_keywords))
+        if not text:
+            return False
+        # Сигнал всегда короткий — строка-другая. Ограничение по длине
+        # отсекает обычные новости, где те же слова встречаются в тексте
+        # («пожарная опасность», «отбой дан вчера»), иначе уведомления
+        # превратились бы в поток и их перестали бы читать.
+        if len(text) > 200:
+            return False
+        return bool(re.search(r'тревог|отбой|опасност', text, re.I))
+
+    def get_keywords_count(self) -> Dict[str, int]:
+        return {name: len(phrases) for name, phrases in self.keywords.items()}

@@ -14,6 +14,10 @@ from src.storage import PostStorage
 from src.filter import TextFilter
 from src.llm_extractor import LLMExtractor, verify_windows, is_gvo_post
 from src.energy_formatter import EnergyFormatter
+from src.vk_parser import VKParser
+from src.plate_recognizer import PlateRecognizer
+from src.vision_recognizer import VisionRecognizer
+from src.signal_state import SignalState
 from src.logger import setup_logger
 
 logger = setup_logger('main')
@@ -53,12 +57,43 @@ class AlertBot:
             self.publishers.append(self.max_publisher)
 
         self.storage = PostStorage(Config.DATA_FILE, default_channel=Config.SOURCE_CHANNEL)
+
+        # Виды сигналов заданы данными (см. Config.signals): фразы + шаблон.
+        self.signals = Config.signals()
         self.filter = TextFilter(
-            alert_keywords_file=Config.KEYWORDS_ALERT_FILE,
-            clear_keywords_file=Config.KEYWORDS_CLEAR_FILE
+            {name: spec['keywords_file'] for name, spec in self.signals.items()}
+        )
+        # Дедуп по состоянию, а не по времени: один сигнал приходит из двух
+        # источников с разбегом в минуты, и старое окно в 180 секунд его уже
+        # не ловило.
+        self.signal_state = SignalState(
+            Config.SIGNAL_STATE_FILE, ttl_seconds=Config.SIGNAL_DEDUP_SECONDS
         )
         self._skip_old = True  # При старте фильтруем старые посты
-        self._last_published = {}  # шаблон -> время последней публикации (дедуп)
+
+        # Источник сигналов ВКонтакте (опционально). Нужен потому, что в
+        # телеграм автор публикует нестабильно и с опозданием, а часть сигналов
+        # выкладывает картинкой без подписи — текстом их не поймать.
+        self.vk_parser = None
+        self.plate_recognizer = None
+        self.vision = None
+        self._vk_skip_old = True
+        self._vk_attempts = {}  # id поста -> неудачных попыток распознать картинку
+        if Config.VK_ENABLED:
+            logger.info(f"🔵 ВК: читаем стену {Config.VK_DOMAIN} (интервал {Config.VK_CHECK_INTERVAL}с)")
+            self.vk_parser = VKParser(
+                token=Config.VK_SERVICE_TOKEN,
+                domain=Config.VK_DOMAIN,
+                api_version=Config.VK_API_VERSION,
+            )
+            if Config.LLM_API_KEY and Config.VISION_MODEL:
+                self.vision = VisionRecognizer(
+                    api_key=Config.LLM_API_KEY,
+                    base_url=Config.LLM_BASE_URL,
+                    model=Config.VISION_MODEL,
+                )
+                logger.info(f"👁 Незнакомые картинки читает {Config.VISION_MODEL}")
+            self.plate_recognizer = PlateRecognizer(Config.PLATES_DIR, vision=self.vision)
 
         # Второй источник — канал энергетиков (опционально)
         self.energy_parser = None
@@ -113,23 +148,32 @@ class AlertBot:
         await self.storage.load()
         logger.info(f"Загружено {len(self.storage.processed_posts)} обработанных постов")
 
+        await self.signal_state.load()
+        logger.info(f"Состояние сигналов: {self.signal_state.describe()}")
+
         # Загрузка ключевых фраз
         try:
-            alert_count, clear_count = self.filter.load_keywords()
+            counts = self.filter.load_keywords()
             logger.info(
-                f"Инициализирован фильтр: {alert_count} фраз тревоги, "
-                f"{clear_count} фраз отбоя"
+                "Инициализирован фильтр сигналов: "
+                + ", ".join(f"{self.signals[n]['title']} — {c} фраз" for n, c in counts.items())
             )
 
-            if alert_count == 0 and clear_count == 0:
+            if not counts or sum(counts.values()) == 0:
                 logger.warning("ВНИМАНИЕ: Списки ключевых фраз пусты! Сообщения не будут публиковаться.")
-
-            logger.info(f"Шаблон тревоги: '{Config.ALERT_TEMPLATE[:50]}...'")
-            logger.info(f"Шаблон отбоя: '{Config.CLEAR_TEMPLATE[:50]}...'")
 
         except Exception as e:
             logger.error(f"Ошибка при инициализации фильтра: {e}")
             raise
+
+        # Эталоны картинок-плашек: часть сигналов источник публикует картинкой
+        # без подписи, текстом их не поймать вовсе.
+        if self.plate_recognizer:
+            if self.plate_recognizer.load_plates() == 0:
+                logger.warning(
+                    "ВНИМАНИЕ: эталонов плашек нет — картинки будут распознаваться "
+                    "только зрением (медленнее) или не распознаваться вовсе"
+                )
 
     async def stop(self):
         await self.client.disconnect()
@@ -137,6 +181,10 @@ class AlertBot:
             await self.max_publisher.close()
         if self.llm_extractor:
             await self.llm_extractor.close()
+        if self.vk_parser:
+            await self.vk_parser.close()
+        if self.vision:
+            await self.vision.close()
         logger.info("Бот остановлен")
 
     def _is_message_fresh(self, message) -> bool:
@@ -187,72 +235,26 @@ class AlertBot:
                 # НЕ помечаем как обработанный - возможно текст будет добавлен позже
                 continue
 
-            # Определяем тип сообщения (тревога/отбой)
-            message_type = self.filter.check_message(message)
+            # Определяем вид сигнала (воздушная тревога, отбой, морская опасность…)
+            signal = self.filter.check_message(message)
 
-            if message_type == 'alert':
-                logger.info(
-                    f"Пост {message.id} - ТРЕВОГА! "
-                    f"Текст: '{message.text[:100]}...'"
-                )
-
-                if self._is_duplicate_template(Config.ALERT_TEMPLATE):
-                    logger.warning(
-                        f"Пост {message.id}: тревога уже опубликована только что "
-                        f"(источник повторил пост) — не дублируем"
-                    )
-                    await self.storage.mark_processed(message.id)
+            if signal:
+                status = await self.publish_signal(signal, message.id, source='TG')
+                if status == 'failed':
+                    # Не помечаем обработанным — повторим на следующей итерации
                     continue
-
-                # Публикуем шаблон ТРЕВОГИ
-                success = await self.publish_to_all(
-                    template_text=Config.ALERT_TEMPLATE,
-                    source_message_id=message.id
-                )
-
-                if success:
-                    self._last_published[Config.ALERT_TEMPLATE] = datetime.now()
-                    await self.storage.mark_processed(message.id)
+                await self.storage.mark_processed(message.id)
+                if status == 'published':
                     new_posts_count += 1
-                    logger.info(f"Тревога успешно опубликована для поста {message.id}")
-                else:
-                    logger.error(f"Не удалось опубликовать тревогу для поста {message.id}")
-
-            elif message_type == 'clear':
-                logger.info(
-                    f"Пост {message.id} - ОТБОЙ! "
-                    f"Текст: '{message.text[:100]}...'"
-                )
-
-                if self._is_duplicate_template(Config.CLEAR_TEMPLATE):
-                    logger.warning(
-                        f"Пост {message.id}: отбой уже опубликован только что "
-                        f"(источник повторил пост) — не дублируем"
-                    )
-                    await self.storage.mark_processed(message.id)
-                    continue
-
-                # Публикуем шаблон ОТБОЯ
-                success = await self.publish_to_all(
-                    template_text=Config.CLEAR_TEMPLATE,
-                    source_message_id=message.id
-                )
-
-                if success:
-                    self._last_published[Config.CLEAR_TEMPLATE] = datetime.now()
-                    await self.storage.mark_processed(message.id)
-                    new_posts_count += 1
-                    logger.info(f"Отбой успешно опубликован для поста {message.id}")
-                else:
-                    logger.error(f"Не удалось опубликовать отбой для поста {message.id}")
-
             else:
                 # Пост не совпал с ключевыми фразами
                 logger.debug(
                     f"Пост {message.id} не совпадает с ключевыми фразами. "
                     f"Текст: '{message.text[:100]}...'"
                 )
-                # Помечаем как обработанный
+                # Похоже на сигнал, но не опознано — источник мог сменить
+                # формулировку. Раньше такой пост исчезал молча.
+                await self._warn_unmatched(message.text, f"телеграм, пост {message.id}")
                 await self.storage.mark_processed(message.id)
                 filtered_posts_count += 1
 
@@ -263,20 +265,184 @@ class AlertBot:
         if filtered_posts_count > 0:
             logger.debug(f"Отфильтровано постов (не совпали): {filtered_posts_count}")
 
-    def _is_duplicate_template(self, template_text: str) -> bool:
+    async def publish_signal(self, name: str, source_id, source: str = '') -> str:
         """
-        True, если такой же шаблон уже публиковался меньше окна дедупа назад.
+        Публикует шаблон сигнала. Возвращает 'published' | 'duplicate' | 'failed'.
 
-        С 16.07.2026 источник иногда публикует тревогу/отбой двумя одинаковыми
-        сообщениями подряд (разные message_id, разница ~1 сек) — дедуп по ID их
-        не ловит, и в канал уходили два одинаковых поста. Ключ — публикуемый
-        шаблон, а не текст источника: шаблон фиксирован, поэтому даже слегка
-        разные посты дают на выходе одно и то же сообщение.
+        Дубли гасятся по СОСТОЯНИЮ группы сигналов, а не по времени публикации
+        шаблона. Так ловится и повтор источника (два одинаковых поста подряд),
+        и та же тревога, пришедшая из второго источника минутами позже: в ВК
+        сигналы выходят раньше, чем в телеграме. Настоящая повторная тревога
+        после отбоя при этом проходит — состояние группы к тому моменту уже
+        переключено отбоем.
         """
-        last = self._last_published.get(template_text)
-        if last is None:
-            return False
-        return datetime.now() - last < timedelta(seconds=Config.ALERT_DEDUP_SECONDS)
+        spec = self.signals.get(name)
+        if not spec:
+            logger.error(f"Неизвестный вид сигнала «{name}» — публикация отменена")
+            return 'failed'
+
+        title = spec['title']
+        logger.info(f"Сигнал «{title}» из источника {source or '?'} (пост {source_id})")
+
+        if self.signal_state.is_duplicate(spec['group'], spec['kind']):
+            logger.warning(
+                f"«{title}» уже действует (состояние: {self.signal_state.describe()}) — "
+                f"повтор не публикуем"
+            )
+            return 'duplicate'
+
+        success = await self.publish_to_all(spec['template'], source_message_id=source_id)
+        if not success:
+            logger.error(f"Не удалось опубликовать сигнал «{title}» (пост {source_id})")
+            return 'failed'
+
+        await self.signal_state.remember(spec['group'], spec['kind'])
+        logger.info(f"Сигнал «{title}» опубликован (пост {source_id}, источник {source or '?'})")
+        return 'published'
+
+    async def _warn_unmatched(self, text: str, where: str):
+        """
+        Сообщает администратору о тексте, который похож на сигнал, но не опознан.
+
+        Страховка от тихого отказа: источник меняет формулировки (так появилась
+        «Морская опасность», которой не было в списках), и раньше несовпавший
+        пост просто исчезал в логах. Публиковать такое нельзя — только показать
+        человеку, чтобы он добавил фразу в файл.
+        """
+        if not self.filter.looks_like_signal(text):
+            return
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.warning(f"Похоже на сигнал, но не опознано ({where}): {text[:120]!r}")
+        await self.notify_admin(
+            f"[AlertBot] {now}\n"
+            f"Похоже на сигнал, но не совпало ни с одной фразой ({where}).\n"
+            f"Проверьте и при необходимости добавьте фразу в data/keywords_*.txt:\n\n"
+            f"{text[:600]}"
+        )
+
+    async def _signal_from_vk_post(self, post):
+        """
+        Вид сигнала для поста ВК и способ распознавания, либо (None, причина).
+
+        Порядок важен для цены и скорости:
+        1) текст поста — бесплатно и мгновенно;
+        2) если текста НЕТ, а картинка есть — сверка с эталонами по хешу, тоже
+           бесплатно;
+        3) и только если картинка незнакомая — зрение LLM.
+
+        Посты, где текст ЕСТЬ, но это не сигнал, — обычные новости с
+        иллюстрациями; в их картинки не смотрим вовсе. Плашки сигналов
+        приходят без подписи, так что ничего не теряем, зато не тратим запросы
+        к модели на каждое фото со стены.
+        """
+        signal = self.filter.get_message_type(post.text)
+        if signal:
+            return signal, 'текст'
+        if post.text:
+            await self._warn_unmatched(post.text, f"ВК, пост {post.id}")
+            return None, 'обычный пост'
+        if not post.photo_urls or not self.plate_recognizer:
+            return None, 'нет картинок'
+
+        data = await self.vk_parser.download_photo(post.photo_urls[0])
+        if not data:
+            return None, 'картинку не скачать'
+
+        text, how = await self.plate_recognizer.recognize(data)
+        if not text:
+            return None, 'картинка не распознана'
+
+        signal = self.filter.get_message_type(text)
+        if not signal:
+            # Что-то прочли, но это не сигнал: либо картинка не плашка, либо
+            # источник придумал новую формулировку — второе важно показать.
+            await self._warn_unmatched(text, f"ВК, картинка в посте {post.id}")
+            return None, 'распознано, но не сигнал'
+
+        if how == 'vision':
+            # Новая плашка: сохраняем в эталоны, чтобы следующий раз она
+            # узнавалась мгновенно и без обращения к модели.
+            saved = self.plate_recognizer.remember_plate(data, text, prefix=signal)
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            await self.notify_admin(
+                f"[AlertBot] {now}\n"
+                f"Новая картинка-плашка распознана зрением как «{text}» "
+                f"и добавлена в эталоны ({saved or 'файл не сохранён'}).\n"
+                f"Пост: {post.url}"
+            )
+
+        return signal, f'картинка/{how}'
+
+    async def process_vk_posts(self):
+        channel = f'vk:{Config.VK_DOMAIN}'
+        posts = await self.vk_parser.get_latest_posts(limit=10)
+
+        # После старта — старые посты помечаем без обработки, свежие оставляем
+        if self._vk_skip_old:
+            fresh = 0
+            for post in posts:
+                if self.storage.is_processed(post.id, channel):
+                    continue
+                if self._is_message_fresh(post):
+                    fresh += 1
+                else:
+                    await self.storage.mark_processed(post.id, channel)
+            self._vk_skip_old = False
+            if fresh == 0:
+                return
+            logger.info(f"ВК: {fresh} свежих постов будут обработаны")
+
+        for post in reversed(posts):
+            if self.storage.is_processed(post.id, channel):
+                continue
+
+            signal, how = await self._signal_from_vk_post(post)
+
+            if signal:
+                self._vk_attempts.pop(post.id, None)
+                status = await self.publish_signal(signal, post.id, source=f'ВК/{how}')
+                if status == 'failed':
+                    # Ошибка публикации — не помечаем, повторим позже
+                    continue
+                await self.storage.mark_processed(post.id, channel)
+                continue
+
+            if how in ('картинку не скачать', 'картинка не распознана'):
+                # Временная неудача (сеть, шлюз) — пробуем ещё, но не вечно:
+                # молчаливо потерять сигнал нельзя, но и крутить его бесконечно
+                # тоже незачем.
+                attempts = self._vk_attempts.get(post.id, 0) + 1
+                self._vk_attempts[post.id] = attempts
+                if attempts < 3:
+                    logger.warning(f"ВК пост {post.id}: {how}, попытка {attempts} — повторим")
+                    continue
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                await self.notify_admin(
+                    f"[AlertBot] {now}\n"
+                    f"Пост ВК без текста с картинкой не удалось распознать "
+                    f"за {attempts} попытки ({how}). Проверьте вручную:\n{post.url}"
+                )
+                self._vk_attempts.pop(post.id, None)
+
+            await self.storage.mark_processed(post.id, channel)
+
+    async def _vk_loop(self):
+        """
+        Отдельный фоновый цикл для стены ВК.
+
+        Изолирован от цикла телеграма: скачивание картинки и обращение к зрению
+        занимают секунды, и задерживать из-за них проверку основного источника
+        нельзя.
+        """
+        logger.info(f"ВК: запущен отдельный цикл (интервал {Config.VK_CHECK_INTERVAL}с)")
+        while True:
+            try:
+                await self.process_vk_posts()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Ошибка в цикле ВК: {e}", exc_info=True)
+            await asyncio.sleep(Config.VK_CHECK_INTERVAL)
 
     def _is_duplicate_content(self, text: str) -> bool:
         """
@@ -463,15 +629,19 @@ class AlertBot:
     async def run(self):
         await self.start()
         energy_task = None
+        vk_task = None
 
         try:
             logger.info(f"Начат мониторинг канала {Config.SOURCE_CHANNEL}")
             logger.info(f"Целевой канал TG: {Config.TARGET_CHANNEL}")
             if Config.MAX_ENABLED:
                 logger.info(f"Целевой канал MAX: {Config.MAX_TARGET_CHANNEL}")
+            if Config.VK_ENABLED:
+                logger.info(f"Источник сигналов ВК: vk.ru/{Config.VK_DOMAIN}")
             if Config.ENERGY_ENABLED:
                 logger.info(f"Второй источник (энергоканал): {Config.ENERGY_SOURCE_CHANNEL}, модель LLM: {Config.LLM_MODEL}")
             logger.info(f"Интервал проверки: {Config.CHECK_INTERVAL} секунд")
+            logger.info(f"Виды сигналов: {', '.join(s['title'] for s in self.signals.values())}")
 
             if Config.RANDOM_DELAY:
                 logger.info(f"Случайные задержки включены: ±{Config.DELAY_VARIANCE} секунд")
@@ -479,6 +649,11 @@ class AlertBot:
             # Энергоканал крутится в отдельной задаче, чтобы не влиять на тревоги
             if self.energy_parser:
                 energy_task = asyncio.create_task(self._energy_loop())
+
+            # ВК — тоже отдельной задачей: он не зависит от соединения с
+            # телеграмом и не должен ждать его переподключения.
+            if self.vk_parser:
+                vk_task = asyncio.create_task(self._vk_loop())
 
             while True:
                 try:
@@ -534,12 +709,13 @@ class AlertBot:
         except KeyboardInterrupt:
             logger.info("Получен сигнал остановки")
         finally:
-            if energy_task:
-                energy_task.cancel()
-                try:
-                    await energy_task
-                except asyncio.CancelledError:
-                    pass
+            for task in (energy_task, vk_task):
+                if task:
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
             await self.stop()
 
 async def main():
